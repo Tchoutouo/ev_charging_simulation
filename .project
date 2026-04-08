@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<projectDescription>
+	<name>ev_charging_simulation</name>
+	<comment></comment>
+	<projects>
+	</projects>
+	<buildSpec>
+		<buildCommand>
+			<name>org.eclipse.xtext.ui.shared.xtextBuilder</name>
+			<arguments>
+			</arguments>
+		</buildCommand>
+	</buildSpec>
+	<natures>
+		<nature>org.eclipse.xtext.ui.shared.xtextNature</nature>
+		<nature>gama.ui.application.gamaNature</nature>
+	</natures>
+	<linkedResources>
+		<link>
+			<name>models/ev_charging_gis (2).gaml</name>
+			<type>1</type>
+			<location>C:/Users/YVALTT/Downloads/ev_charging_gis (2).gaml</location>
+		</link>
+		<link>
+			<name>models/ev_charging_gis (3).gaml</name>
+			<type>1</type>
+			<location>C:/Users/YVALTT/Downloads/ev_charging_gis (3).gaml</location>
+		</link>
+	</linkedResources>
+</projectDescription>
