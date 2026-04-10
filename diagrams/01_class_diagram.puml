@@ -1,10 +1,10 @@
 @startuml 01_Diagramme_de_Classes
 
-skinparam backgroundColor #1E1E2E
-skinparam classBackgroundColor #2A2A3E
-skinparam classBorderColor #7C7CFF
-skinparam classHeaderBackgroundColor #3A3A5C
-skinparam classFontColor #E0E0FF
+' skinparam backgroundColor #1E1E2E
+' skinparam classBackgroundColor #2A2A3E
+' skinparam classBorderColor #7C7CFF
+' skinparam classHeaderBackgroundColor #3A3A5C
+' skinparam classFontColor #E0E0FF
 skinparam attributeFontColor #C0C0FF
 skinparam arrowColor #7C7CFF
 skinparam noteBackgroundColor #2E2E4E
