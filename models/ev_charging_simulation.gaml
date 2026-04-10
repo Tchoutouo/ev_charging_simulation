@@ -70,26 +70,16 @@ global {
 
     float initial_battery_min <- 10.0;   // Véhicules en crise dès t=0
     float initial_battery_max <- 100.0;
-    float battery_threshold   <- 30.0;
 
     // -------------------------------------------------------
-    // 4. PARAMÈTRES PHYSIQUES recalibés pour step=5s
-    //    Distance/cycle = 40 km/h × 5s = 55 m = 0.055 km
-    //    Conso/cycle    = 0.45 kWh/km × 0.055 km = 0.0247 kWh
-    //    ΔSoC/cycle     = 0.0247 / 10 kWh × 100  = 0.247 %
-    //    Vide (100→30%) : 70 / 0.247 = ~283 cycles ≈ 23 min simulées
-    //    Recharge 150kW : ΔSoC/cycle = (150 × 5/3600) / 10 × 100 = 2.08 %/cycle
-    //    Plein (30→95%) : 65 / 2.08 = ~31 cycles ≈ 2.5 min simulées
+    // 4. PARAMÈTRES INFRASTRUCTURE (Énergie & Économie)
     // -------------------------------------------------------
-    float battery_capacity_kwh   <- 10.0;   // Petite batterie = cycles d'état rapides
-    float energy_consumption_kwh <- 0.45;   // Consommation réaliste-accélérée
-    float charging_power_kw      <- 150.0;  // Superchargeur → recharge en ~31 cycles
-    float vehicle_speed          <- 40.0;   // Vitesse (km/h)
+    float global_station_grid_power <- 300.0; // kW totaux partagés par la station
+    float global_base_price         <- 0.30;  // Prix au kWh de base
+    float nominal_charging_power_kw <- 150.0; // Prise individuelle max
 
     // -------------------------------------------------------
     // 5. SEUIL D'ARRIVÉE À LA STATION
-    //    Avec step=5s et speed=40km/h : mouvement = 55 m/cycle.
-    //    Un seuil de 60 m détecte correctement l'arrivée sans over-shoot.
     // -------------------------------------------------------
     float arrival_threshold <- 60.0;   // mètres
 
@@ -237,14 +227,37 @@ global {
             // Placement sur un nœud réel du graphe = garanti navigable dès t=0
             location      <- one_of(navigable_locs);
             battery_level <- rnd(initial_battery_min, initial_battery_max);
-            speed         <- vehicle_speed / 3.6;   // km/h → m/s
+            
+            // --- HÉTÉROGÉNÉITÉ : Assignation des profils ---
+            float proba <- rnd(1.0);
+            if (proba < 0.60) {
+                profile <- "taxi";
+                battery_capacity_kwh   <- 20.0;
+                energy_consumption_kwh <- 0.40;
+                battery_threshold      <- 15.0;
+                speed                  <- 40.0 / 3.6;
+                price_sensitivity      <- 0.2; // Préfère le temps (+ alpha) à l'argent
+            } else if (proba < 0.80) {
+                profile <- "delivery";
+                battery_capacity_kwh   <- 60.0;
+                energy_consumption_kwh <- 0.80;
+                battery_threshold      <- 30.0;
+                speed                  <- 30.0 / 3.6; // Plus lent
+                price_sensitivity      <- 0.5; // Équilibré
+            } else {
+                profile <- "personal";
+                battery_capacity_kwh   <- 35.0;
+                energy_consumption_kwh <- 0.30;
+                battery_threshold      <- 40.0; // Anxieux de la panne
+                speed                  <- 40.0 / 3.6;
+                price_sensitivity      <- 0.8; // Préfère détours pour bornes moins chères
+            }
+            
             state         <- "driving";
             initial_soh   <- rnd(85.0, 100.0);
             battery_soh   <- initial_soh;
         }
-        write string(nb_vehicles) + " véhicules créés.";
-        write "Autonomie théorique : " + string(with_precision(battery_capacity_kwh / energy_consumption_kwh, 0)) + " km";
-        write "Durée recharge (22 kW) : " + string(with_precision(battery_capacity_kwh / charging_power_kw, 1)) + " h";
+        write string(nb_vehicles) + " véhicules créés avec profils hétérogènes.";
         write "=== Simulation démarrée ===";
     }
 
@@ -329,6 +342,21 @@ species charging_station {
     int           occupied_slots <- 0;
     list<vehicle> queue          <- [];
     int           nb_served      <- 0;
+
+    // ÉNERGIE ET ÉCONOMIE
+    float current_price <- global_base_price;
+    
+    // Mise à jour économique : le prix fluctue avec l'affluence (file d'attente incluse)
+    reflex update_economics {
+        float stress_factor <- (capacity > 0) ? (occupied_slots + length(queue)) / float(max(1, capacity * 2)) : 0.0;
+        current_price <- global_base_price * (1.0 + stress_factor * 2.0); // Peut atteindre ~3x le prix initial
+    }
+    
+    // Partage équitable de l'énergie du réseau électrique local
+    float get_shared_power_kw {
+        if (occupied_slots = 0) { return nominal_charging_power_kw; }
+        return min(nominal_charging_power_kw, global_station_grid_power / float(occupied_slots));
+    }
 
     // ALGORITHME 6 : File d'attente FIFO
     // Les véhicules sont servis dans leur ordre d'arrivée.
@@ -417,6 +445,14 @@ species vehicle skills: [moving] {
     float            distance_traveled <- 0.0;   // mètres
     int              waiting_time_start <- 0;
 
+    // --- HÉTÉROGÉNÉITÉ & ÉCONOMIE ---
+    string           profile;
+    float            battery_capacity_kwh;
+    float            energy_consumption_kwh;
+    float            battery_threshold;
+    float            price_sensitivity;
+    int              parked_counter <- 0;
+
     // ALGORITHME 10 — SoH (State of Health)
     float initial_soh <- 100.0;
     float battery_soh <- 100.0;
@@ -460,6 +496,16 @@ species vehicle skills: [moving] {
             // Pas de return : le véhicule continue de se déplacer ce cycle
         }
 
+        // --- HÉTÉROGÉNÉITÉ : Transition vers l'état 'parked' ---
+        if (state = "driving" and profile = "personal" and target_point = nil and flip(0.005)) {
+            // Un particulier qui se balade sans but précis a une probabilité
+            // de trouver sa destination et de stationner (ex: 5 à 15 minutes simulées).
+            state          <- "parked";
+            target_point   <- nil;
+            parked_counter <- rnd(50, 150); 
+            return;
+        }
+
         // Cible aléatoire sur un nœud réel du graphe (jamais un segment isolé)
         if (target_point = nil) {
             target_point  <- one_of(navigable_locs);
@@ -493,6 +539,23 @@ species vehicle skills: [moving] {
             if (location distance_to target_point < arrival_threshold) {
                 target_point <- nil;
             }
+        }
+    }
+
+    // -------------------------------------------------------
+    // FSM — ÉTAT : parked (Exclusif aux particuliers)
+    // -------------------------------------------------------
+    reflex do_parked when: (state = "parked") {
+        parked_counter <- parked_counter - 1;
+        
+        // S'il est garé mais s'aperçoit que sa batterie est critique, il sort pour charger
+        if (battery_level < battery_threshold) {
+             state <- "searching";
+             return;
+        }
+        
+        if (parked_counter <= 0) {
+            state <- "driving";
         }
     }
 
@@ -660,14 +723,15 @@ species vehicle skills: [moving] {
 
         float hours_per_cycle    <- step / 3600.0;
         float effective_power_kw;
+        float allocated_power <- target_station.get_shared_power_kw();
 
         if (battery_level < 80.0) {
-            // Phase CC : puissance nominale complète
-            effective_power_kw <- charging_power_kw;
+            // Phase CC : puissance nominale complète allouée par le réseau
+            effective_power_kw <- allocated_power;
         } else {
-            // Phase CV : dégradation linéaire (100%→10% entre 80%→100%)
+            // Phase CV : dégradation linéaire proportionnelle à l'allocation
             float soc_factor   <- 1.0 - ((battery_level - 80.0) / 20.0) * 0.9;
-            effective_power_kw <- charging_power_kw * max(0.1, soc_factor);
+            effective_power_kw <- allocated_power * max(0.1, soc_factor);
         }
 
         float energy_charged_kwh <- effective_power_kw * hours_per_cycle;
@@ -804,22 +868,30 @@ species vehicle skills: [moving] {
         }
 
         // --- NIVEAU 2 : toutes les stations sont pleines — WSM ---
-        // On cherche le meilleur compromis distance / file d'attente.
+        // On cherche le meilleur compromis distance / file d'attente / PRIX.
         float ratio <- (battery_threshold > 0.0) ? (battery_level / battery_threshold) : 1.0;
-        float alpha <- alpha_base * min(1.0, ratio);
-        float beta  <- 1.0 - alpha;
+        
+        // Poids dynamiques : la composante spatio-temporelle (alpha+beta) vs la financière (gamma)
+        float gamma        <- price_sensitivity;
+        float non_fin_w    <- 1.0 - gamma;
+        float alpha_factor <- non_fin_w * min(1.0, ratio);
+        float alpha        <- alpha_factor; 
+        float beta         <- non_fin_w - alpha_factor;
 
         float max_dist  <- max(candidates collect (self distance_to each.location));
         float max_queue <- float(max(candidates collect length(each.queue)));
+        float max_price <- max(candidates collect each.current_price);
         if (max_dist  <= 0.0) { max_dist  <- 1.0; }
         if (max_queue <= 0.0) { max_queue <- 1.0; }
+        if (max_price <= 0.0) { max_price <- 1.0; }
 
         charging_station best       <- nil;
         float            best_score <- #infinity;
         loop s over: candidates {
             float nd <- (self distance_to s.location) / max_dist;
             float nq <- float(length(s.queue)) / max_queue;
-            float sc <- alpha * nd + beta * nq;
+            float np <- s.current_price / max_price;
+            float sc <- alpha * nd + beta * nq + gamma * np;
             if (sc < best_score) { best_score <- sc; best <- s; }
         }
         return best;
@@ -868,6 +940,13 @@ species vehicle skills: [moving] {
             draw "SoH:" + string(int(battery_soh)) + "%"
                  at: {location.x + icon_size * 0.55, location.y + icon_size * 0.3}
                  color: #yellow font: font("Arial", 8, #plain);
+        }
+        
+        // Label Profil Hétérogène
+        string lbl <- (profile="taxi") ? "TAXI" : ((profile="delivery") ? "LIVR" : "");
+        if (lbl != "") {
+             draw lbl at: {location.x - icon_size*0.4, location.y - icon_size*0.9}
+                  color: (profile="taxi") ? #yellow : #cyan font: font("Arial", 7, #bold);
         }
     }
 
@@ -928,13 +1007,11 @@ experiment EVSimulation type: gui {
 
     parameter "Batterie initiale min (%)"  var: initial_battery_min      min: 10.0   max: 100.0  category: "Batterie";
     parameter "Batterie initiale max (%)"  var: initial_battery_max      min: 10.0   max: 100.0  category: "Batterie";
-    parameter "Seuil d'alerte (%)"         var: battery_threshold        min: 5.0    max: 50.0   category: "Batterie";
-    parameter "Capacité batterie (kWh)"    var: battery_capacity_kwh     min: 20.0   max: 150.0  category: "Batterie";
-    parameter "Consommation (kWh/km)"      var: energy_consumption_kwh   min: 0.10   max: 0.35   category: "Batterie";
-    parameter "Puissance recharge (kW)"    var: charging_power_kw        min: 3.7    max: 150.0  category: "Batterie";
     parameter "Dégradation SoH (%/1000km)" var: soh_degradation_per_1000km min: 0.0  max: 2.0   category: "Batterie";
 
-    parameter "Vitesse (km/h)"             var: vehicle_speed            min: 10.0   max: 130.0  category: "Déplacement";
+    // Paramètres liés aux infrastructures énergétiques
+    parameter "Puissance Grille(kW)"       var: global_station_grid_power min: 100.0 max: 1000.0 category: "Infrastructures";
+    parameter "Prix de base (€/kWh)"       var: global_base_price         min: 0.1   max: 1.0    category: "Infrastructures";
 
     parameter "Alpha (poids distance)"     var: alpha_base               min: 0.0    max: 1.0    category: "Stratégie";
     parameter "Beta (poids file)"          var: beta_base                min: 0.0    max: 1.0    category: "Stratégie";
@@ -985,7 +1062,7 @@ experiment EVSimulation type: gui {
                 data "Batterie moy." value: mean(vehicle collect (each.battery_level)) color: #green  style: line;
                 data "SoH moyen"     value: mean(vehicle collect (each.battery_soh))   color: #blue   style: line;
                 data "Batterie min." value: kpi_min_battery                            color: #orange style: line;
-                data "Seuil alerte"  value: battery_threshold                          color: #red    style: line;
+                data "Seuil al. moy." value: mean(vehicle collect (each.battery_threshold)) color: #red    style: line;
             }
 
             chart "Énergie totale (kWh)" type: series background: #white {
@@ -1126,7 +1203,6 @@ experiment EVSimulation type: gui {
         monitor "Recharges totales"         value: total_charges;
         monitor "Récupérations"             value: total_recoveries;
         monitor "Distance fleet (km)"       value: with_precision(total_distance_km, 1);
-        monitor "Autonomie théo. (km)"      value: with_precision(battery_capacity_kwh / energy_consumption_kwh, 0);
     }
 }
 
@@ -1140,8 +1216,6 @@ experiment BatchExploration type: batch repeat: 3 until: (cycle >= 5000) keep_se
 
     parameter "nb_vehicles"            var: nb_vehicles            among: [20, 50, 100, 200];
     parameter "nb_stations"            var: nb_stations            among: [5, 10, 15, 20];
-    parameter "battery_threshold"      var: battery_threshold      among: [15.0, 25.0, 35.0];
-    parameter "energy_consumption_kwh" var: energy_consumption_kwh among: [0.15, 0.18, 0.22];
 
     permanent {
         display "Résultats Batch" {
@@ -1151,8 +1225,8 @@ experiment BatchExploration type: batch repeat: 3 until: (cycle >= 5000) keep_se
             chart "Recharges vs stations" type: scatter background: #white {
                 data "Recharges" value: {float(nb_stations), float(total_charges)} color: #green;
             }
-            chart "Distance vs consommation" type: scatter background: #white {
-                data "Distance" value: {energy_consumption_kwh, total_distance_km} color: #blue;
+            chart "Distance vs Nb Stations" type: scatter background: #white {
+                data "Distance" value: {float(nb_stations), total_distance_km} color: #blue;
             }
         }
     }
