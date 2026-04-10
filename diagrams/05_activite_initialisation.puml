@@ -1,0 +1,70 @@
+@startuml 05_Activite_Init
+
+skinparam backgroundColor #1E1E2E
+skinparam ActivityBackgroundColor #2A2A3E
+skinparam ActivityBorderColor #7C7CFF
+skinparam ActivityFontColor #E0E0FF
+skinparam ArrowColor #7C7CFF
+skinparam ArrowFontColor #AAAAFF
+skinparam PartitionBackgroundColor #252540
+skinparam PartitionBorderColor #5555AA
+skinparam PartitionFontColor #CCCCFF
+skinparam NoteBackgroundColor #2E2E4E
+skinparam NoteBorderColor #5555AA
+skinparam DiamondBackgroundColor #3A2A5A
+skinparam DiamondBorderColor #7C7CFF
+
+title Diagramme d'Activités — Initialisation de la Simulation
+
+|**GAMA Engine**|
+start
+:Charger roads.shp\n(fichier GIS);
+
+|**global — init()**|
+:create road from: roads_file;
+note right : N tronçons routiers\ncréés comme agents
+
+:road_network ← as_edge_graph(road);
+note right : **Algorithme 1**\nGraphe topologique pondéré\n(poids = longueur en m)
+
+:Calculer les centroides\nroad_points ← road collect centroid;
+
+:Initialiser grille régulière\ngrid_side = int(sqrt(nb_stations)) + 1\ndw = largeur / grid_side\ndh = hauteur / grid_side;
+note right : **Algorithme 7**\nDivision spatiale homogène
+
+|**Boucle : création stations**|
+:idx ← 0;
+while (idx < nb_stations ?) is (Oui)
+    :Calculer centre de cellule\n(row, col) → grid_center;
+    :closest ← road_points\nwith_min_of(dist à grid_center);
+    note right : Projection sur road la plus proche
+    :s.location ← closest;
+    :s.capacity ← station_capacity;
+    :idx++;
+endwhile (Non)
+
+|**global — init()**|
+:15 stations créées\navec couverture spatiale uniforme;
+
+|**Boucle : création véhicules**|
+:i ← 0;
+while (i < nb_vehicles ?) is (Oui)
+    :location ← any_location_in(one_of(road));
+    :battery_level ← rnd(40%, 100%);
+    :battery_soh ← rnd(85%, 100%);
+    :speed ← vehicle_speed / 3.6  [m/s];
+    :state ← "driving";
+    :stuck_counter ← 0;
+    :i++;
+endwhile (Non)
+
+|**global — init()**|
+:50 véhicules créés sur le réseau;
+:Afficher statistiques initiales\n(autonomie théorique, durée recharge);
+:Démarrer la boucle de simulation;
+
+|**GAMA Engine**|
+:Activer tous les réflexes\n(do_drive, do_search, etc.);
+stop
+
+@enduml

@@ -1,0 +1,106 @@
+@startuml 03_Sequence_Recharge
+
+skinparam backgroundColor #1E1E2E
+skinparam ParticipantBackgroundColor #2A2A3E
+skinparam ParticipantBorderColor #7C7CFF
+skinparam ParticipantFontColor #E0E0FF
+skinparam SequenceArrowColor #7C7CFF
+skinparam SequenceArrowFontColor #AAAAFF
+skinparam SequenceLifeLineBorderColor #5555AA
+skinparam SequenceGroupBackgroundColor #2A2A3E
+skinparam SequenceGroupBodyBackgroundColor #1E1E2E
+skinparam SequenceGroupHeaderFontColor #FFCC00
+skinparam NoteBackgroundColor #2E2E4E
+skinparam NoteBorderColor #5555AA
+skinparam NoteFontColor #CCCCFF
+
+title Diagramme de Séquence — Cycle complet de recharge d'un VE
+
+actor "Environnement\nGAMA" as ENV
+participant "vehicle V1\n(FSM)" as V
+participant "charging_station S1\n(FIFO)" as S
+participant "road_network\n(Graphe)" as G
+
+== Phase 1 : Déplacement normal (state = driving) ==
+
+loop Chaque cycle tant que battery ≥ threshold
+    ENV -> V : do_drive() reflex
+    V -> G   : do goto(target_point, road_network, speed)
+    G --> V  : position mise à jour (Dijkstra)
+    V -> V   : consume_energy_for(dist_moved)\n[Δsoc = conso(kWh/km) × dist_km / capacité]
+    V -> V   : update_soh()\n[SoH = 100 - (total_km/1000) × 0.5]
+end
+
+note over V : battery < battery_threshold (25%)\n→ transition : driving → searching
+
+== Phase 2 : Recherche de station (state = searching) ==
+
+ENV -> V : do_search() reflex
+V -> V   : select_best_station()\n[WSM : score = α·dist_norm + β·queue_norm]
+note right of V
+  <b>Algorithme WSM pondéré :</b>
+  ratio = battery / threshold
+  α = alpha_base × min(1, ratio)
+  β = 1 - α
+  → Sélection station S1
+end note
+V --> V  : target_station ← S1\nstate ← "queuing"
+
+== Phase 3 : Navigation vers la station (state = queuing) ==
+
+loop Tant que dist_to_station > arrival_threshold (100m)
+    ENV -> V : do_queue() reflex
+    V -> G   : do goto(S1.location, road_network, speed)
+    G --> V  : position mise à jour (Dijkstra)
+    V -> V   : consume_energy_for(dist_moved)
+    V -> V   : stuck_counter++ si dist_moved < 1.0\n[si counter ≥ 3 → changer station]
+end
+
+V -> V : reached_station ← true
+V -> S : is_full() ?
+
+alt Station disponible (slot libre)
+    V -> S : occupied_slots++
+    S --> V : OK
+    V --> V : state ← "charging"
+
+else Station pleine → file d'attente FIFO
+    V -> S : add_to_queue(V1)
+    S --> V : ajouté en queue
+    V -> V  : waiting_time_start ← cycle
+    note over V, S
+      V1 reste en état "queuing"
+      Il sera activé par start_charging()
+      quand une place se libère (FIFO)
+    end note
+end
+
+== Phase 4 : Recharge (state = charging) ==
+
+loop Tant que battery < SoH × 95%
+    ENV -> V : do_charge() reflex
+    V -> V   : Courbe CC-CV\n[<80% → P=22kW ; ≥80% → P décroît]
+    V -> V   : battery += (P × Δt) / capacité × 100
+end
+
+V -> S  : release_vehicle(V1)
+S -> S  : occupied_slots--\nstart_charging()\n[défile prochain véhicule FIFO]
+V --> V : target_station ← nil\nreached_station ← false\nstate ← "driving"
+
+note over V : Cycle complet terminé\nV1 reprend la route avec batterie rechargée
+
+== Phase 5 : Récupération de panne ==
+
+note over V : Si battery = 0 : breakdown()
+
+ENV -> V : do_recovery() reflex [state=broken]
+V -> V   : blink_visible = (cycle mod 10 < 5)\n[Effet clignotant]
+
+loop Pendant breakdown_recovery_cycles (100 cycles)
+    ENV -> V : do_recovery()
+    V -> V   : Attente dépannage
+end
+
+V --> V : battery ← 25.0\nstuck_counter ← 0\nstate ← "searching"
+
+@enduml

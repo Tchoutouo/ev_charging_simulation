@@ -1,0 +1,144 @@
+@startuml 01_Diagramme_de_Classes
+
+skinparam backgroundColor #1E1E2E
+skinparam classBackgroundColor #2A2A3E
+skinparam classBorderColor #7C7CFF
+skinparam classHeaderBackgroundColor #3A3A5C
+skinparam classFontColor #E0E0FF
+skinparam attributeFontColor #C0C0FF
+skinparam arrowColor #7C7CFF
+skinparam noteBackgroundColor #2E2E4E
+skinparam noteBorderColor #5555AA
+skinparam noteFontColor #CCCCFF
+skinparam title FontColor #FFFFFF
+skinparam title FontSize 16
+
+title Diagramme de Classes — Simulation de Recharge VE (GAMA)
+
+' ===================== GLOBAL =====================
+class GlobalEnvironment <<global>> {
+    ' -- Données GIS --
+    + roads_file : file
+    + road_network : graph
+    ' -- Temps --
+    + step : float = 30.0 s/cycle
+    ' -- Paramètres simulation --
+    + nb_vehicles : int = 50
+    + nb_stations : int = 15
+    + station_capacity : int = 6
+    ' -- Paramètres batterie --
+    + battery_capacity_kwh : float = 60.0
+    + energy_consumption_kwh : float = 0.18
+    + charging_power_kw : float = 22.0
+    + vehicle_speed : float = 40.0 km/h
+    + battery_threshold : float = 25.0 %
+    + initial_battery_min : float = 40.0
+    + initial_battery_max : float = 100.0
+    ' -- Paramètres dégradation --
+    + soh_degradation_per_1000km : float = 0.5
+    + soh_min : float = 70.0
+    + arrival_threshold : float = 100.0 m
+    ' -- Paramètres stratégie WSM --
+    + alpha_base : float = 0.7
+    + beta_base : float = 0.3
+    ' -- Monitoring --
+    + total_breakdowns : int
+    + total_charges : int
+    + total_distance_km : float
+    + total_wait_time : float
+    + total_recoveries : int
+    ' -- Méthodes --
+    + init() : void
+    + collect_indicators() : void <<reflex>>
+}
+
+' ===================== ROAD =====================
+class road <<species>> {
+    + speed_limit : float = 50.0
+    --
+    + base() : aspect
+}
+
+' ===================== CHARGING STATION =====================
+class charging_station <<species>> {
+    ' -- Attributs --
+    + capacity : int
+    + occupied_slots : int = 0
+    + queue : list<vehicle> = []
+    + nb_served : int = 0
+    --
+    ' -- Actions FIFO --
+    + add_to_queue(v : vehicle) : void
+    + start_charging() : void
+    + release_vehicle(v : vehicle) : void
+    ' -- Fonctions --
+    + is_full() : bool
+    + occupancy_rate() : float
+    --
+    + icon_aspect() : aspect
+    + base() : aspect
+}
+
+' ===================== VEHICLE =====================
+class vehicle <<species>> {
+    ' -- État FSM --
+    + state : string
+    + battery_level : float
+    + battery_soh : float = 100.0
+    + target_station : charging_station
+    + target_point : point
+    ' -- Métriques --
+    + distance_traveled : float
+    + total_km : float
+    + waiting_time_start : int
+    ' -- Contrôleurs internes --
+    + reached_station : bool = false
+    + stuck_counter : int = 0
+    + breakdown_cycle : int = 0
+    --
+    ' -- Réflexes FSM --
+    + do_drive() : reflex [state="driving"]
+    + do_search() : reflex [state="searching"]
+    + do_queue() : reflex [state="queuing"]
+    + do_charge() : reflex [state="charging"]
+    + do_recovery() : reflex [state="broken"]
+    ' -- Actions utilitaires --
+    + consume_energy_for(dist_m : float) : void
+    + update_soh() : void
+    + breakdown() : void
+    + select_best_station() : charging_station
+    --
+    + icon_aspect() : aspect
+    + base() : aspect
+}
+
+' ===================== RELATIONS =====================
+
+GlobalEnvironment "1" o-- "N" road : crée >
+GlobalEnvironment "1" o-- "15" charging_station : crée >
+GlobalEnvironment "1" o-- "50" vehicle : crée >
+GlobalEnvironment "1" -- "1" road_network : construit graphe >
+
+vehicle "0..*" --> "0..1" charging_station : target_station >
+charging_station "1" o-- "0..*" vehicle : queue <
+
+note right of vehicle
+  <b>Skill</b> : moving (GAMA)
+  Utilise <b>do goto</b> sur road_network
+  Algorithme de routage : <i>Dijkstra</i>
+end note
+
+note left of charging_station
+  File d'attente <b>FIFO</b>
+  Gestion des slots par actions
+  Sert les véhicules dans l'ordre
+end note
+
+note bottom of GlobalEnvironment
+  <b>Exécution</b> : GAMA 1.9.x
+  <b>GIS</b> : Shapefile roads.shp
+  Le graphe routier est partagé
+  par tous les véhicules.
+end note
+
+@enduml

@@ -1,0 +1,91 @@
+@startuml 08_Interaction_Agents
+
+skinparam backgroundColor #1E1E2E
+skinparam AgentBackgroundColor #2A2A3E
+skinparam AgentBorderColor #7C7CFF
+skinparam AgentFontColor #E0E0FF
+skinparam SequenceArrowColor #7C7CFF
+skinparam SequenceArrowFontColor #AAAAFF  
+skinparam SequenceLifeLineBorderColor #5555AA
+skinparam ParticipantBackgroundColor #2A2A3E
+skinparam ParticipantBorderColor #7C7CFF
+skinparam ParticipantFontColor #E0E0FF
+skinparam NoteBackgroundColor #2E2E4E
+skinparam NoteBorderColor #5555AA
+skinparam NoteFontColor #CCCCFF
+
+title Diagramme d'Interaction entre Agents — Protocole de Recharge
+
+participant "global\n(Environnement)" as G
+participant "vehicle V1" as V1
+participant "vehicle V2" as V2
+participant "charging_station S" as S
+participant "road_network" as N
+
+note over G : Chaque cycle, GAMA active\ntous les réflexes en parallèle
+
+== Cycle T : V1 arrive à la station, V2 attend ==
+
+G -> V1 : [reflex do_queue, state=queuing]
+G -> V2 : [reflex do_queue, state=queuing]
+
+V1 -> N : do goto(S.location, road_network)
+N --> V1 : location mis à jour (Dijkstra)
+
+V2 -> N : do goto(S.location, road_network)
+N --> V2 : location mis à jour (Dijkstra)
+
+V1 -> S : is_full() ?
+S --> V1 : false (slot disponible)
+V1 -> S : occupied_slots <- occupied_slots + 1
+V1 --> V1 : state <- "charging"
+
+V2 -> S : is_full() ?
+S --> V2 : true (slot occupé par V1)
+V2 -> S : add_to_queue(V2)
+note over S : queue = [V2]\nFIFO activée
+V2 --> V2 : waiting_time_start <- cycle T
+
+== Cycle T+K : V1 finit de charger ==
+
+G -> V1 : [reflex do_charge, battery ≥ SoH×95%]
+V1 -> S : release_vehicle(V1)
+note right of S
+  <b>release_vehicle(V1) :</b>
+  occupied_slots -= 1
+  nb_served += 1
+  total_charges += 1
+  → start_charging()
+end note
+S -> S : start_charging()
+note right of S
+  <b>start_charging() :</b>
+  Tant que slot libre ET queue non vide :
+    nxt ← first(queue)  [FIFO]
+    remove nxt from queue
+    occupied_slots += 1
+    nxt.state ← "charging"
+    total_wait_time += (T+K - nxt.waiting_start)
+end note
+S -> V2 : state <- "charging"\ntotal_wait_time mise à jour
+
+V1 --> V1 : target_station <- nil\nreached_station <- false\nstate <- "driving"
+
+== Cycle T+K+1 : V2 charge, V1 reprend la route ==
+
+G -> V1 : [reflex do_drive]
+V1 -> N : do goto(new_target, road_network)
+note over V1 : V1 reprend\nla circulation
+
+G -> V2 : [reflex do_charge]
+V2 -> V2 : battery += ΔSoC (CC-CV)
+note over V2 : V2 est maintenant\nen recharge
+
+== Protocole de panne en route vers la station ==
+
+G -> V2 : [reflex do_queue, battery=0]
+V2 -> S : (V2 in queue) → remove V2 from queue
+V2 --> V2 : breakdown()\n[state="broken"]
+note over V2 : V2 quitte proprement\nla file avant mise en panne
+
+@enduml

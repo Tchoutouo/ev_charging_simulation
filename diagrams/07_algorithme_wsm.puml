@@ -1,0 +1,86 @@
+@startuml 07_Algorithme_WSM
+
+skinparam backgroundColor #1E1E2E
+skinparam ActivityBackgroundColor #2A2A3E
+skinparam ActivityBorderColor #7C7CFF
+skinparam ActivityFontColor #E0E0FF
+skinparam ArrowColor #7C7CFF
+skinparam ArrowFontColor #AAAAFF
+skinparam DiamondBackgroundColor #3A2A5A
+skinparam DiamondBorderColor #7C7CFF
+skinparam NoteBackgroundColor #2E2E4E
+skinparam NoteBorderColor #5555AA
+skinparam NoteFontColor #CCCCFF
+
+title Algorithme de Sélection de Station\nWeighted Sum Method (WSM) + Adaptation Dynamique α/β
+
+|**Véhicule V**|
+start
+
+:Récupérer la liste de toutes les\nstations de recharge\ncandidates ← list(charging_station);
+
+if (candidates est vide ?) then (Oui)
+    :Retourner nil;
+    stop
+endif
+
+' --- Algorithme 4 : Adaptation dynamique ---
+:ratio ← battery_level / battery_threshold;
+note right
+  **Algorithme 4 — Ratio dynamique**
+  Si batterie → 0 : ratio → 0
+  → α diminue → β augmente
+  → Priorité à la file courte
+  Si batterie > seuil : ratio ≥ 1
+  → α = alpha_base (0.7)
+  → Priorité à la distance
+end note
+:α ← alpha_base × min(1.0, ratio)\nβ ← 1.0 - α;
+
+' --- Normalisation ---
+:max_dist ← max(distances vers toutes les stations)\nmax_queue ← max(tailles des files);
+if (max_dist ≤ 0 ?) then (Oui)
+    :max_dist ← 1.0;
+endif
+if (max_queue ≤ 0 ?) then (Oui)
+    :max_queue ← 1;
+endif
+
+' --- Boucle WSM ---
+:best ← nil\nbest_score ← +infini;
+
+|**Boucle sur les stations**|
+:Pour chaque station s dans candidates :;
+repeat
+    :nd ← dist(V, s) / max_dist\n[Distance normalisée ∈ [0,1]];
+    :nq ← |queue(s)| / max_queue\n[File normalisée ∈ [0,1]];
+    :score ← **α × nd + β × nq**;
+    note right
+      **WSM — Critères :**
+      nd → proximité géographique
+      nq → disponibilité (file courte)
+      Pondération adaptative selon urgence
+    end note
+    if (s.is_full() AND |queue| > capacity) then (Oui)
+        :score ← score + 0.5\n[Pénalité saturation];
+    endif
+    if (score < best_score) then (Oui)
+        :best_score ← score\nbest ← s;
+    endif
+repeat while (autres stations ?) is (Oui)
+-> Non;
+
+|**Véhicule V**|
+:Retourner best\n[la station avec le score le plus bas];
+
+note bottom
+  **Interprétation du score :**
+  Score faible → Station préférée
+  α·nd domine : Station la plus proche
+  β·nq domine : Station la moins encombrée
+  Équilibre α/β → Compromis distance/disponibilité
+end note
+
+stop
+
+@enduml

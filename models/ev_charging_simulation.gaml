@@ -50,7 +50,7 @@ global {
     // -------------------------------------------------------
     // 1. FICHIERS GIS
     // -------------------------------------------------------
-    file       roads_file <- file("../includes/roads2.shp");
+    file       roads_file <- file("../includes/roads.shp");
     geometry   shape      <- envelope(roads_file);
 
     // -------------------------------------------------------
@@ -66,8 +66,8 @@ global {
     // 3. PARAMÈTRES DE SIMULATION
     // -------------------------------------------------------
     int   nb_vehicles      <- 50;
-    int   nb_stations      <- 15;   // Couverture suffisante (était 10)
-    int   station_capacity <- 6;    // Capacité augmentée (était 4)
+    int   nb_stations      <- 15;
+    int   station_capacity <- 4;    // Max 4 véhicules par station
 
     float initial_battery_min <- 40.0;
     float initial_battery_max <- 100.0;
@@ -129,11 +129,26 @@ global {
     // -------------------------------------------------------
     graph road_network;
 
-    int   total_breakdowns  <- 0;
-    int   total_charges     <- 0;
-    float total_distance_km <- 0.0;
-    float total_wait_time   <- 0.0;
-    int   total_recoveries  <- 0;
+    // --- Compteurs événements ---
+    int   total_breakdowns   <- 0;    // Nb total de pannes
+    int   total_charges      <- 0;    // Nb total de recharges complètes
+    float total_distance_km  <- 0.0;  // Distance fleet totale (km)
+    float total_wait_time    <- 0.0;  // Attente totale cumulée (cycles)
+    int   total_recoveries   <- 0;    // Nb de retours après panne
+    float total_energy_kwh   <- 0.0;  // Énergie totale rechargée (kWh)
+    float total_consumed_kwh <- 0.0;  // Énergie totale consommée (kWh)
+
+    // --- KPIs calculés chaque cycle ---
+    float kpi_fleet_availability  <- 0.0;  // % véhicules opérationnels (pas broken)
+    float kpi_charge_rate         <- 0.0;  // % véhicules en charge / flotte totale
+    float kpi_avg_wait_per_charge <- 0.0;  // Attente moyenne par recharge (cycles)
+    float kpi_breakdown_rate      <- 0.0;  // Pannes / 100 km (fiabilité)
+    float kpi_avg_station_occ     <- 0.0;  // Taux occupation moyen des stations (%)
+    float kpi_energy_efficiency   <- 0.0;  // kWh rechargés / kWh consommés
+    float kpi_throughput          <- 0.0;  // Recharges complètes / 100 cycles
+    float kpi_min_battery         <- 0.0;  // Batterie minimum dans la flotte (%)
+    float kpi_stuck_rate          <- 0.0;  // % véhicules bloqués (stuck_counter > 0)
+    int   kpi_total_queue_length  <- 0;    // Longueur totale des files d'attente
 
     // -------------------------------------------------------
     // 11. INITIALISATION
@@ -191,8 +206,65 @@ global {
         write "=== Simulation démarrée ===";
     }
 
+    // -------------------------------------------------------
+    // 12. COLLECTE DES INDICATEURS — calcul des KPIs chaque cycle
+    //     Tous les indicateurs dérivés sont calculés ici centralement
+    //     pour être disponibles dans les charts et moniteurs.
+    // -------------------------------------------------------
     reflex collect_indicators {
-        float occ <- mean(charging_station collect (each.occupancy_rate()));
+        int   n_vehicles      <- length(vehicle);
+        int   n_stations      <- length(charging_station);
+        int   n_broken        <- vehicle count (each.state = "broken");
+        int   n_charging      <- vehicle count (each.state = "charging");
+        int   n_stuck         <- vehicle count (each.stuck_counter > 0);
+
+        // KPI 1 — Disponibilité de la flotte (%)
+        kpi_fleet_availability <- (n_vehicles > 0)
+            ? (float(n_vehicles - n_broken) / float(n_vehicles)) * 100.0
+            : 0.0;
+
+        // KPI 2 — Taux de recharge instantané (%)
+        kpi_charge_rate <- (n_vehicles > 0)
+            ? (float(n_charging) / float(n_vehicles)) * 100.0
+            : 0.0;
+
+        // KPI 3 — Attente moyenne par recharge complète (cycles)
+        kpi_avg_wait_per_charge <- (total_charges > 0)
+            ? total_wait_time / float(total_charges)
+            : 0.0;
+
+        // KPI 4 — Taux de panne pour 100 km parcourus
+        kpi_breakdown_rate <- (total_distance_km > 0.0)
+            ? (float(total_breakdowns) / total_distance_km) * 100.0
+            : 0.0;
+
+        // KPI 5 — Occupation moyenne des stations (%)
+        kpi_avg_station_occ <- (n_stations > 0)
+            ? mean(charging_station collect (each.occupancy_rate())) * 100.0
+            : 0.0;
+
+        // KPI 6 — Efficacité énergétique (kWh rechargés / kWh consommés)
+        kpi_energy_efficiency <- (total_consumed_kwh > 0.0)
+            ? total_energy_kwh / total_consumed_kwh
+            : 0.0;
+
+        // KPI 7 — Débit de recharge (recharges complètes / 100 cycles)
+        kpi_throughput <- (cycle > 0)
+            ? (float(total_charges) / float(cycle)) * 100.0
+            : 0.0;
+
+        // KPI 8 — Batterie minimale dans la flotte (%)
+        kpi_min_battery <- (n_vehicles > 0)
+            ? min(vehicle collect (each.battery_level))
+            : 0.0;
+
+        // KPI 9 — Taux de véhicules bloqués (%)
+        kpi_stuck_rate <- (n_vehicles > 0)
+            ? (float(n_stuck) / float(n_vehicles)) * 100.0
+            : 0.0;
+
+        // KPI 10 — Longueur totale des files d'attente
+        kpi_total_queue_length <- sum(charging_station collect (length(each.queue)));
     }
 }
 
@@ -315,12 +387,18 @@ species vehicle skills: [moving] {
 
     // [CORRECTION BUG 3] Flag : le véhicule a-t-il physiquement navigué
     // jusqu'à la station avant d'entrer en recharge ?
-    // Reset à false à chaque nouvelle cible de station.
     bool reached_station <- false;
 
     // [CORRECTION BUG FREEZE] Compteur de cycles sans mouvement.
     // Si stuck_counter >= max_stuck_cycles → cible inaccessible → nouvelle cible.
     int stuck_counter <- 0;
+
+    // [CORRECTION BUG ORANGE IMMOBILE]
+    // Liste noire des stations inaccessibles pour ce véhicule.
+    // Quand une station rend le véhicule stuck, elle est blacklistée
+    // pour éviter que select_best_station() la choisisse à nouveau
+    // → brise le cycle infini searching ↔ queuing sans mouvement.
+    list<charging_station> blacklisted_stations <- [];
 
     // -------------------------------------------------------
     // FSM — ÉTAT : driving
@@ -447,11 +525,15 @@ species vehicle skills: [moving] {
             do consume_energy_for(dist_moved);
 
             // --- DÉTECTION DE BLOCAGE VERS LA STATION ---
-            // Si bloqué, chercher une autre station plutôt que de rester figé.
+            // Si bloqué N cycles de suite, la station est inaccessible
+            // via ce graphe : on la blackliste et on cherche une autre station.
             if (dist_moved < 1.0 and dist_to_station > arrival_threshold) {
                 stuck_counter <- stuck_counter + 1;
                 if (stuck_counter >= max_stuck_cycles) {
-                    // Station inaccessible → retour à searching pour en choisir une autre
+                    // Blacklister cette station inaccessible
+                    if (!(target_station in blacklisted_stations)) {
+                        add target_station to: blacklisted_stations;
+                    }
                     target_station  <- nil;
                     reached_station <- false;
                     stuck_counter   <- 0;
@@ -492,7 +574,7 @@ species vehicle skills: [moving] {
     // -------------------------------------------------------
     reflex do_charge when: (state = "charging") {
 
-        // [BUG 4 CORRIGÉ] : Incohérence d'état possible après récupération de panne
+        // Garde : incohérence d'état possible → retour à "driving"
         if (target_station = nil) {
             state <- "driving";
             return;
@@ -502,10 +584,10 @@ species vehicle skills: [moving] {
         float effective_power_kw;
 
         if (battery_level < 80.0) {
-            // Phase CC : puissance nomimale complète
+            // Phase CC : puissance nominale complète
             effective_power_kw <- charging_power_kw;
         } else {
-            // Phase CV : dégradation linéaire de la puissance (100%→10% entre 80%→100%)
+            // Phase CV : dégradation linéaire (100%→10% entre 80%→100%)
             float soc_factor   <- 1.0 - ((battery_level - 80.0) / 20.0) * 0.9;
             effective_power_kw <- charging_power_kw * max(0.1, soc_factor);
         }
@@ -514,7 +596,8 @@ species vehicle skills: [moving] {
         float delta_soc          <- (energy_charged_kwh / battery_capacity_kwh) * 100.0;
         float effective_max      <- battery_soh;   // Plafond SoH
 
-        battery_level <- min(effective_max, battery_level + delta_soc);
+        battery_level    <- min(effective_max, battery_level + delta_soc);
+        total_energy_kwh <- total_energy_kwh + energy_charged_kwh;  // Énergie rechargée cumulée
 
         // Fin de charge : libérer la place et reprendre la route
         if (battery_level >= effective_max * 0.95) {
@@ -537,14 +620,15 @@ species vehicle skills: [moving] {
 
         // Récupération après N cycles (dépannage virtuel)
         if (cycle - breakdown_cycle >= breakdown_recovery_cycles) {
-            battery_level    <- 25.0;      // Recharge d'urgence
-            state            <- "searching";
-            breakdown_cycle  <- 0;
-            target_station   <- nil;
-            target_point     <- nil;
-            reached_station  <- false;
-            stuck_counter    <- 0;
-            total_recoveries <- total_recoveries + 1;
+            battery_level        <- 25.0;
+            state                <- "searching";
+            breakdown_cycle      <- 0;
+            target_station       <- nil;
+            target_point         <- nil;
+            reached_station      <- false;
+            stuck_counter        <- 0;
+            blacklisted_stations <- [];   // Réinitialiser la liste noire après dépannage
+            total_recoveries     <- total_recoveries + 1;
         }
     }
 
@@ -565,6 +649,7 @@ species vehicle skills: [moving] {
         distance_traveled <- distance_traveled + actual_dist_m;
         total_km          <- total_km + dist_km;
         total_distance_km <- total_distance_km + dist_km;
+        total_consumed_kwh <- total_consumed_kwh + energy_kwh;  // Énergie consommée cumulée
 
         // ALGORITHME 10 : Mise à jour SoH
         do update_soh;
@@ -591,25 +676,33 @@ species vehicle skills: [moving] {
         if (target_station != nil and (self in target_station.queue)) {
             ask target_station { remove myself from: queue; }
         }
-        state            <- "broken";
-        target_station   <- nil;
-        target_point     <- nil;
-        reached_station  <- false;
-        stuck_counter    <- 0;
-        breakdown_cycle  <- 0;
-        total_breakdowns <- total_breakdowns + 1;
+        state                <- "broken";
+        target_station       <- nil;
+        target_point         <- nil;
+        reached_station      <- false;
+        stuck_counter        <- 0;
+        breakdown_cycle      <- 0;
+        blacklisted_stations <- [];   // Réinitialiser la liste noire à chaque panne
+        total_breakdowns     <- total_breakdowns + 1;
     }
 
     // -------------------------------------------------------
     // ALGORITHME 3 : Sélection de station — Weighted Sum Method (WSM)
-    //   score = α × dist_normalisée + β × file_normalisée
+    //   Score = α × dist_normalisée + β × file_normalisée
+    //   Les stations blacklistées (inaccessibles) sont EXCLUES.
     //
-    // ALGORITHME 4 : Poids dynamiques α/β
-    //   ratio = battery / threshold → plus la batterie est faible,
-    //   plus α (poids distance) augmente → favorise la station la plus proche.
+    // ALGORITHME 4 : Poids dynamiques α/β selon urgence batterie.
+    //   ratio = battery / threshold → faible batterie → α fort → station la plus proche.
     // -------------------------------------------------------
     charging_station select_best_station {
-        list<charging_station> candidates <- list(charging_station);
+        // Exclure les stations inaccessibles (blacklist) pour casser le cycle infini
+        list<charging_station> candidates <- list(charging_station) - blacklisted_stations;
+
+        // Sécurité : si toutes sont blacklistées, réinitialiser la blacklist
+        if (empty(candidates)) {
+            blacklisted_stations <- [];
+            candidates <- list(charging_station);
+        }
         if (empty(candidates)) { return nil; }
 
         float ratio <- (battery_threshold > 0.0) ? (battery_level / battery_threshold) : 1.0;
@@ -752,21 +845,68 @@ experiment EVSimulation type: gui {
             species vehicle          aspect: icon_aspect;
         }
 
-        display "Indicateurs" refresh: every(10 #cycles) {
+        // -------------------------------------------------------
+        // TABLEAU DE BORD 1 — États & Flux de la flotte
+        // -------------------------------------------------------
+        display "États & Flux" refresh: every(10 #cycles) {
 
-            chart "États des véhicules" type: pie background: #white {
-                data "Roulant"    value: vehicle count (each.state = "driving")   color: #dodgerblue;
-                data "Recherche"  value: vehicle count (each.state = "searching") color: #orange;
-                data "En file"    value: vehicle count (each.state = "queuing")   color: #darkorange;
-                data "En charge"  value: vehicle count (each.state = "charging")  color: #limegreen;
-                data "En panne"   value: vehicle count (each.state = "broken")    color: #red;
+            chart "Distribution des états (véhicules)" type: pie background: #white {
+                data "🚗 Roulant"   value: vehicle count (each.state = "driving")   color: #dodgerblue;
+                data "🔍 Recherche" value: vehicle count (each.state = "searching") color: #orange;
+                data "⏳ En file"   value: vehicle count (each.state = "queuing")   color: #darkorange;
+                data "⚡ En charge" value: vehicle count (each.state = "charging")  color: #limegreen;
+                data "💥 En panne"  value: vehicle count (each.state = "broken")    color: #red;
             }
 
-            chart "Batterie & SoH moyens (%)" type: series background: #white {
-                data "Batterie moy."  value: mean(vehicle collect (each.battery_level)) color: #green style: line;
-                data "SoH moyen (%)"  value: mean(vehicle collect (each.battery_soh))   color: #blue  style: line;
-                data "Seuil alerte"   value: battery_threshold                          color: #red   style: line;
+            chart "Flux d'événements cumulés" type: series background: #white {
+                data "Pannes"        value: total_breakdowns color: #red    style: line;
+                data "Recharges"     value: total_charges    color: #green  style: line;
+                data "Récupérations" value: total_recoveries color: #orange style: line;
             }
+
+            chart "Disponibilité de la flotte (%)" type: series background: #white {
+                data "Disponibilité" value: kpi_fleet_availability color: #limegreen style: line;
+                data "Taux en charge" value: kpi_charge_rate       color: #steelblue style: line;
+                data "Taux bloqués"   value: kpi_stuck_rate        color: #red       style: line;
+            }
+
+            chart "Taille des files d'attente" type: series background: #white {
+                data "File totale" value: kpi_total_queue_length color: #purple style: line;
+            }
+        }
+
+        // -------------------------------------------------------
+        // TABLEAU DE BORD 2 — Énergie & Batterie
+        // -------------------------------------------------------
+        display "Énergie & Batterie" refresh: every(10 #cycles) {
+
+            chart "Niveaux batterie (%)" type: series background: #white {
+                data "Batterie moy." value: mean(vehicle collect (each.battery_level)) color: #green  style: line;
+                data "SoH moyen"     value: mean(vehicle collect (each.battery_soh))   color: #blue   style: line;
+                data "Batterie min." value: kpi_min_battery                            color: #orange style: line;
+                data "Seuil alerte"  value: battery_threshold                          color: #red    style: line;
+            }
+
+            chart "Énergie totale (kWh)" type: series background: #white {
+                data "Rechargée"   value: total_energy_kwh   color: #limegreen style: line;
+                data "Consommée"   value: total_consumed_kwh color: #red       style: line;
+            }
+
+            chart "Efficacité énergétique" type: series background: #white {
+                data "kWh rechargés / kWh consommés" value: kpi_energy_efficiency color: #cyan style: line;
+            }
+
+            chart "SoH individuel par véhicule (%)" type: histogram background: #white {
+                loop v over: list(vehicle) {
+                    data "V" + int(v) value: v.battery_soh color: #teal;
+                }
+            }
+        }
+
+        // -------------------------------------------------------
+        // TABLEAU DE BORD 3 — Stations & Performance
+        // -------------------------------------------------------
+        display "Stations & Performance" refresh: every(10 #cycles) {
 
             chart "Occupation des stations (%)" type: histogram background: #white {
                 loop s over: list(charging_station) {
@@ -774,43 +914,95 @@ experiment EVSimulation type: gui {
                 }
             }
 
-            chart "Pannes / Recharges / Récupérations" type: series background: #white {
-                data "Pannes"          value: total_breakdowns  color: #red    style: line;
-                data "Recharges"       value: total_charges     color: #green  style: line;
-                data "Récupérations"   value: total_recoveries  color: #orange style: line;
-            }
-
-            chart "Distance totale (km)" type: series background: #white {
-                data "Distance km" value: total_distance_km color: #blue style: line;
-            }
-
-            chart "SoH par véhicule (%)" type: histogram background: #white {
-                loop v over: list(vehicle) {
-                    data "V" + int(v) value: v.battery_soh color: #teal;
+            chart "Véhicules servis par station" type: histogram background: #white {
+                loop s over: list(charging_station) {
+                    data "St-" + int(s) value: s.nb_served color: #limegreen;
                 }
+            }
+
+            chart "File d'attente par station" type: histogram background: #white {
+                loop s over: list(charging_station) {
+                    data "St-" + int(s) value: length(s.queue) color: #orange;
+                }
+            }
+
+            chart "KPIs de performance" type: series background: #white {
+                data "Taux occ. moy. (%)"   value: kpi_avg_station_occ     color: #steelblue style: line;
+                data "Attente moy. (cycles)" value: kpi_avg_wait_per_charge color: #orange    style: line;
+                data "Débit recharges/100c"  value: kpi_throughput          color: #limegreen style: line;
             }
         }
 
-        monitor "Cycle"                  value: cycle;
-        monitor "Pas simulé (s)"         value: step;
-        monitor "Roulant"                value: vehicle count (each.state = "driving");
-        monitor "En charge"              value: vehicle count (each.state = "charging");
-        monitor "En file"                value: vehicle count (each.state = "queuing");
-        monitor "En recherche"           value: vehicle count (each.state = "searching");
-        monitor "En panne (actuel)"      value: vehicle count (each.state = "broken");
-        monitor "Pannes totales"         value: total_breakdowns;
-        monitor "Recharges totales"      value: total_charges;
-        monitor "Récupérations"          value: total_recoveries;
-        monitor "Distance totale (km)"   value: with_precision(total_distance_km, 1);
-        monitor "Taux occ. moy. (%)"     value: with_precision(
-                                             mean(charging_station collect (each.occupancy_rate())) * 100, 1);
-        monitor "Batterie moy. (%)"      value: with_precision(
-                                             mean(vehicle collect (each.battery_level)), 1);
-        monitor "SoH moyen (%)"          value: with_precision(
-                                             mean(vehicle collect (each.battery_soh)), 1);
-        monitor "Attente totale (cycles)" value: with_precision(total_wait_time, 1);
-        monitor "Autonomie théo. (km)"   value: with_precision(
-                                             battery_capacity_kwh / energy_consumption_kwh, 0);
+        // -------------------------------------------------------
+        // TABLEAU DE BORD 4 — Mobilité & Fiabilité
+        // -------------------------------------------------------
+        display "Mobilité & Fiabilité" refresh: every(10 #cycles) {
+
+            chart "Distance totale parcourue (km)" type: series background: #white {
+                data "Distance fleet" value: total_distance_km color: #dodgerblue style: line;
+            }
+
+            chart "Taux de panne (pannes / 100 km)" type: series background: #white {
+                data "Taux panne" value: kpi_breakdown_rate color: #red style: line;
+            }
+
+            chart "Distance individuelle par véhicule (km)" type: histogram background: #white {
+                loop v over: list(vehicle) {
+                    data "V" + int(v) value: v.total_km color: #dodgerblue;
+                }
+            }
+
+            chart "Attente totale cumulée (cycles)" type: series background: #white {
+                data "Total attente" value: total_wait_time color: #darkorange style: line;
+            }
+        }
+
+        // -------------------------------------------------------
+        // MONITEURS — KPIs principaux (panneau latéral GAMA)
+        // [Simulation]
+        // -------------------------------------------------------
+        monitor "── SIMULATION ──"          value: "Cycle " + cycle;
+        monitor "Cycle courant"             value: cycle;
+        monitor "Temps simulé (min)"        value: with_precision(cycle * step / 60.0, 1);
+        monitor "Pas de temps (s)"          value: step;
+
+        // [États flotte]
+        monitor "── FLOTTE ──"             value: nb_vehicles;
+        monitor "🚗 Roulant"               value: vehicle count (each.state = "driving");
+        monitor "🔍 Recherche"             value: vehicle count (each.state = "searching");
+        monitor "⏳ En file"               value: vehicle count (each.state = "queuing");
+        monitor "⚡ En charge"             value: vehicle count (each.state = "charging");
+        monitor "💥 En panne"              value: vehicle count (each.state = "broken");
+
+        // [KPIs flotte]
+        monitor "── KPIs FLOTTE ──"         value: "";
+        monitor "Disponibilité (%)"         value: with_precision(kpi_fleet_availability, 1);
+        monitor "Taux bloqués (%)"          value: with_precision(kpi_stuck_rate, 1);
+        monitor "Taux panne /100km"         value: with_precision(kpi_breakdown_rate, 3);
+
+        // [KPIs énergie]
+        monitor "── ÉNERGIE ──"             value: "";
+        monitor "Batterie moy. (%)"         value: with_precision(mean(vehicle collect each.battery_level), 1);
+        monitor "Batterie min. (%)"         value: with_precision(kpi_min_battery, 1);
+        monitor "SoH moyen (%)"             value: with_precision(mean(vehicle collect each.battery_soh), 1);
+        monitor "Consommée (kWh)"           value: with_precision(total_consumed_kwh, 1);
+        monitor "Rechargée (kWh)"           value: with_precision(total_energy_kwh, 1);
+        monitor "Efficacité énergie"        value: with_precision(kpi_energy_efficiency, 2);
+
+        // [KPIs stations]
+        monitor "── STATIONS ──"            value: nb_stations;
+        monitor "Occupation moy. (%)"       value: with_precision(kpi_avg_station_occ, 1);
+        monitor "File totale (véhicules)"   value: kpi_total_queue_length;
+        monitor "Attente moy. (cycles)"     value: with_precision(kpi_avg_wait_per_charge, 1);
+        monitor "Débit (/100 cycles)"       value: with_precision(kpi_throughput, 2);
+
+        // [Totaux]
+        monitor "── TOTAUX ──"              value: "";
+        monitor "Pannes totales"            value: total_breakdowns;
+        monitor "Recharges totales"         value: total_charges;
+        monitor "Récupérations"             value: total_recoveries;
+        monitor "Distance fleet (km)"       value: with_precision(total_distance_km, 1);
+        monitor "Autonomie théo. (km)"      value: with_precision(battery_capacity_kwh / energy_consumption_kwh, 0);
     }
 }
 
