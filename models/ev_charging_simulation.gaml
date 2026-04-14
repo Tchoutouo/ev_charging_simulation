@@ -1,33 +1,5 @@
 /**
- * ============================================================
- *  EV Charging Station Simulation — GAMA Platform (Version GIS Corrigée)
- *
- *  BUGS CORRIGÉS (v3) :
- *  [BUG 1] Véhicules immobiles en état "searching" :
- *          → do_search ne déplaçait PAS le véhicule si aucune station trouvée.
- *          → Correction : déplacement aléatoire maintenu pendant la recherche.
- *
- *  [BUG 2] Seuil d'arrivée à la station trop petit (5.0 m) :
- *          → Avec speed*step ≈ 333 m/cycle, le véhicule pouvait sauter
- *            par-dessus la station sans jamais déclencher la condition.
- *          → Correction : seuil relevé à arrival_threshold (100 m par défaut).
- *
- *  [BUG 3] Véhicule en panne qui "se recharge seul" :
- *          → Après récupération (state="searching"), si le véhicule était
- *            déjà à moins de 5 m d'une station, do_queue déclenchait
- *            immédiatement l'état "charging" SANS bouger vers la station.
- *          → Correction : flag reached_station — le véhicule ne peut entrer
- *            en recharge que s'il a physiquement navigué jusqu'à la station.
- *
- *  [BUG 4] do_charge sans garde sur target_station = nil :
- *          → Si target_station = nil (incohérence d'état), GAMA crashait.
- *          → Correction : garde explicite avec retour à l'état "driving".
- *
- *  [BUG 5] consume_energy utilise speed*step (théorique) au lieu de la
- *          distance réellement parcourue par do goto :
- *          → Correction : l'énergie est calculée sur la distance effective
- *            (position avant/après do goto).
- *
+ 
  *  ALGORITHMES UTILISÉS :
  *   1. as_edge_graph()      → Graphe topologique depuis shapefile
  *   2. do goto / Dijkstra   → Plus court chemin sur graphe routier
@@ -346,6 +318,17 @@ species charging_station {
     // ÉNERGIE ET ÉCONOMIE
     float current_price <- global_base_price;
     
+    // Nouveaux ajouts : Résilience et Pannes
+    bool isOperational <- true;
+    
+    reflex station_breakdown when: isOperational and flip(0.0005) {
+        isOperational <- false;
+    }
+    
+    reflex station_repair when: (!isOperational) and flip(0.005) {
+        isOperational <- true;
+    }
+
     // Mise à jour économique : le prix fluctue avec l'affluence (file d'attente incluse)
     reflex update_economics {
         float stress_factor <- (capacity > 0) ? (occupied_slots + length(queue)) / float(max(1, capacity * 2)) : 0.0;
@@ -358,24 +341,30 @@ species charging_station {
         return min(nominal_charging_power_kw, global_station_grid_power / float(occupied_slots));
     }
 
-    // ALGORITHME 6 : File d'attente FIFO
-    // Les véhicules sont servis dans leur ordre d'arrivée.
-    // add : enfile en fin de liste / first() + remove : défile en tête.
+    // ALGORITHME 6 : File d'attente Intelligente et Réservation anticipée
+    // Les véhicules sont triés par priorité.
     action add_to_queue (vehicle v) {
         if (!(v in queue)) {
             add v to: queue;
+            // Tri par priorité décroissante (3 = haut, 1 = bas)
+            queue <- reverse(queue sort_by (each.get_priority()));
             total_queue_entries <- total_queue_entries + 1;  // Compteur d'entrées en file
         }
     }
 
     action start_charging {
-        loop while: (occupied_slots < capacity) and (not empty(queue)) {
-            vehicle nxt <- first(queue);
-            remove nxt from: queue;
-            occupied_slots <- occupied_slots + 1;
-            ask nxt {
-                state              <- "charging";
-                total_wait_time    <- total_wait_time + float(cycle - waiting_time_start);
+        loop while: (occupied_slots < capacity) and (not empty(queue)) and isOperational {
+            // Prendre le véhicule le plus prioritaire qui est DEJA arrivé à la station
+            vehicle nxt <- queue first_with (each.reached_station = true);
+            if (nxt != nil) {
+                remove nxt from: queue;
+                occupied_slots <- occupied_slots + 1;
+                ask nxt {
+                    state              <- "charging";
+                    total_wait_time    <- total_wait_time + float(cycle - waiting_time_start);
+                }
+            } else {
+                break; // Aucun véhicule dans la file n'est physiquement arrivé
             }
         }
     }
@@ -387,15 +376,22 @@ species charging_station {
         do start_charging;
     }
 
-    bool  is_full        { return occupied_slots >= capacity; }
+    bool  is_full        { return occupied_slots >= capacity or !isOperational; }
     float occupancy_rate { return (capacity = 0) ? 0.0 : float(occupied_slots) / float(capacity); }
 
     // ASPECT PRINCIPALE : utilise les icônes depuis le cache global
-    // Aucun rechargement disque — image_file déjà en mémoire.
     aspect icon_aspect {
         float icon_size <- 40.0;
-        // Sélection de l'icône depuis le cache global (pas de image_file() ici)
-        image_file cur_img <- (occupancy_rate() < 0.8) ? icon_station_free : icon_station_busy;
+        image_file cur_img <- icon_station_busy;
+        
+        if (!isOperational) {
+            // Station HS : filtre gris / indication
+            draw icon_station_busy size: {icon_size, icon_size} color: rgb(100,100,100);
+            draw "HS" at: {location.x, location.y} color: #red font: font("Arial", 12, #bold);
+            return;
+        }
+        
+        cur_img <- (occupancy_rate() < 0.8) ? icon_station_free : icon_station_busy;
         draw cur_img size: {icon_size, icon_size};
         draw string(occupied_slots) + "/" + string(capacity)
              at: {location.x, location.y + icon_size * 0.7}
@@ -452,6 +448,15 @@ species vehicle skills: [moving] {
     float            battery_threshold;
     float            price_sensitivity;
     int              parked_counter <- 0;
+    
+    // Réservation et priorité
+    float targetArrivalTime <- 0.0;
+    
+    int get_priority {
+        if (profile = "delivery") { return 3; }
+        else if (profile = "taxi") { return 2; }
+        else { return 1; }
+    }
 
     // ALGORITHME 10 — SoH (State of Health)
     float initial_soh <- 100.0;
@@ -487,8 +492,21 @@ species vehicle skills: [moving] {
     reflex do_drive when: (state = "driving") {
         if (battery_level <= 0.0) { do breakdown; return; }
 
-        // Transition vers la recherche si batterie faible
+        // NOUVEAU: Anticipation = seuil critique OU batterie insuffisante pour faire le trajet + marge station
+        bool need_charge <- false;
         if (battery_level < battery_threshold) {
+            need_charge <- true;
+        } else if (target_point != nil) {
+            float dist_to_target <- location distance_to target_point;
+            // On ajoute 2 km de sécurité pour trouver une station depuis la cible
+            float required_energy_kwh <- energy_consumption_kwh * ((dist_to_target + 2000.0) / 1000.0);
+            float required_soc <- (required_energy_kwh / battery_capacity_kwh) * 100.0;
+            if (battery_level < required_soc) {
+                need_charge <- true;
+            }
+        }
+
+        if (need_charge) {
             state           <- "searching";
             target_point    <- nil;
             target_station  <- nil;
@@ -569,7 +587,45 @@ species vehicle skills: [moving] {
     reflex do_search when: (state = "searching") {
         if (battery_level <= 0.0) { do breakdown; return; }
 
-        charging_station best <- select_best_station();
+        // --- INLINE SELECTION DE STATION (Remplace l'action pour éviter les bugs GAMA) ---
+        list<charging_station> candidates <- list(charging_station) - blacklisted_stations;
+        if (empty(candidates)) {
+            blacklisted_stations <- [];
+            candidates <- list(charging_station);
+        }
+        
+        charging_station best <- nil;
+        
+        if (!empty(candidates)) {
+            list<charging_station> free_stations <- candidates where (!each.is_full());
+            if (!empty(free_stations)) {
+                best <- free_stations with_min_of (self distance_to each.location);
+            } else {
+                float ratio <- (battery_threshold > 0.0) ? (battery_level / battery_threshold) : 1.0;
+                float gamma        <- price_sensitivity;
+                float non_fin_w    <- 1.0 - gamma;
+                float alpha_factor <- non_fin_w * min(1.0, ratio);
+                float alpha        <- alpha_factor; 
+                float beta         <- non_fin_w - alpha_factor;
+
+                float max_dist  <- max(candidates collect (self distance_to each.location));
+                float max_queue <- float(max(candidates collect length(each.queue)));
+                float max_price <- max(candidates collect each.current_price);
+                if (max_dist  <= 0.0) { max_dist  <- 1.0; }
+                if (max_queue <= 0.0) { max_queue <- 1.0; }
+                if (max_price <= 0.0) { max_price <- 1.0; }
+
+                float best_score <- #infinity;
+                loop s over: candidates {
+                    float nd <- (self distance_to s.location) / max_dist;
+                    float nq <- float(length(s.queue)) / max_queue;
+                    float np <- s.current_price / max_price;
+                    float sc <- alpha * nd + beta * nq + gamma * np;
+                    if (sc < best_score) { best_score <- sc; best <- s; }
+                }
+            }
+        }
+        // --- FIN INLINE ---
 
         if (best != nil) {
             // Station trouvée → transition propre vers queuing
@@ -580,6 +636,11 @@ species vehicle skills: [moving] {
             stuck_resets       <- 0;
             queue_wait_counter <- 0;
             state              <- "queuing";
+            
+            // Réservation anticipée : on intègre la file d'attente immédiatement !
+            ask target_station { do add_to_queue(myself); }
+            waiting_time_start <- cycle;
+            
             return;   // do_queue prend le relais au prochain cycle
         }
 
@@ -627,7 +688,13 @@ species vehicle skills: [moving] {
             return;
         }
 
-        if (target_station = nil) {
+        if (target_station = nil or !target_station.isOperational) {
+            if (target_station != nil) {
+                ask target_station { remove myself from: queue; }
+                if (!(target_station in blacklisted_stations)) {
+                    add target_station to: blacklisted_stations;
+                }
+            }
             reached_station    <- false;
             queue_wait_counter <- 0;
             state              <- "searching";
@@ -668,19 +735,11 @@ species vehicle skills: [moving] {
                 // Véhicule en file d'attente
                 queue_wait_counter <- queue_wait_counter + 1;
 
-                // [BUG FIX] Vérification active : si un slot s'est libéré
-                // sans que start_charging ait été appelé (slot fantôme),
-                // on prend le slot directement plutôt que d'attendre indéfiniment.
-                if (!target_station.is_full()) {
-                    ask target_station {
-                        remove myself from: queue;
-                        occupied_slots <- occupied_slots + 1;
-                    }
-                    queue_wait_counter <- 0;
-                    state              <- "charging";
+                // [NOUVEAU] On informe la station qu'on est là pour qu'elle puisse lancer la charge si slot libre
+                ask target_station { do start_charging; }
 
                 // Timeout : abandon après 120 cycles (=10 min simulées) en file
-                } else if (queue_wait_counter > 120) {
+                if (queue_wait_counter > 120) {
                     ask target_station { remove myself from: queue; }
                     if (!(target_station in blacklisted_stations)) {
                         add target_station to: blacklisted_stations;
@@ -710,8 +769,6 @@ species vehicle skills: [moving] {
     //   ALGORITHME 9 : Courbe de recharge CC-CV (Li-ion réaliste)
     //   0%→80%  : Phase CC (Courant Constant) — puissance nominale
     //   80%→100%: Phase CV (Tension Constante) — puissance décroissante
-    //
-    //   [CORRECTION BUG 4] : Garde explicite sur target_station=nil.
     // -------------------------------------------------------
     reflex do_charge when: (state = "charging") {
 
@@ -725,8 +782,16 @@ species vehicle skills: [moving] {
         float effective_power_kw;
         float allocated_power <- target_station.get_shared_power_kw();
 
+        // Modélisation physique avancée : limite selon type de véhicule
+        float max_vehicle_power <- (profile = "delivery") ? 200.0 : ((profile = "taxi") ? 100.0 : 50.0);
+        allocated_power <- min(allocated_power, max_vehicle_power);
+
+        // Limite selon State of Health (SoH) : une batterie usée accepte moins de puissance pour éviter la surchauffe
+        float soh_factor <- max(0.5, battery_soh / 100.0);
+        allocated_power <- allocated_power * soh_factor;
+
         if (battery_level < 80.0) {
-            // Phase CC : puissance nominale complète allouée par le réseau
+            // Phase CC : puissance complète allouée (limitée physiquement)
             effective_power_kw <- allocated_power;
         } else {
             // Phase CV : dégradation linéaire proportionnelle à l'allocation
@@ -776,7 +841,6 @@ species vehicle skills: [moving] {
 
     // -------------------------------------------------------
     // ACTION : Consommation d'énergie sur distance réelle
-    //   [CORRECTION BUG 5] : Prend en paramètre la distance
     //   effectivement parcourue par do goto (pas la distance théorique).
     //   ALGORITHME 8 : ΔSoC = (conso_kWh/km × dist_km / capacité_kWh) × 100
     // -------------------------------------------------------
@@ -819,9 +883,6 @@ species vehicle skills: [moving] {
                 // Véhicule en file → retirer de la file
                 ask target_station { remove myself from: queue; }
             } else if (state = "charging") {
-                // [BUG FIX] Véhicule occupait un slot de charge au moment de la panne.
-                // Sans ce code, occupied_slots restait incrémenté indéfiniment
-                // ("slot fantôme") bloquant les véhicules en attente.
                 ask target_station {
                     occupied_slots <- max(0, occupied_slots - 1);
                     do start_charging;   // Libérer les véhicules en attente
@@ -837,64 +898,6 @@ species vehicle skills: [moving] {
         breakdown_cycle      <- 0;
         blacklisted_stations <- [];
         total_breakdowns     <- total_breakdowns + 1;
-    }
-
-    // -------------------------------------------------------
-    // ALGORITHME 3 : Sélection de station — Priorité 2 niveaux
-    //
-    //   NIVEAU 1 (priorité absolue) : stations avec slot libre (non pleines)
-    //     → Sélection de la PLUS PROCHE. Garantit qu'un véhicule ne passe
-    //     jamais à côté d'une station libre pour aller en chercher une lointaine.
-    //
-    //   NIVEAU 2 (toutes pleines) : WSM classique
-    //     → Trade-off distance / longueur de file d'attente.
-    //     Poids dynamiques α/β selon urgence batterie (ALGORITHME 4).
-    // -------------------------------------------------------
-    charging_station select_best_station {
-        list<charging_station> candidates <- list(charging_station) - blacklisted_stations;
-        if (empty(candidates)) {
-            blacklisted_stations <- [];
-            candidates <- list(charging_station);
-        }
-        if (empty(candidates)) { return nil; }
-
-        // --- NIVEAU 1 : station libre la plus proche ---
-        // Une station "libre" a au moins 1 slot disponible (non pleine).
-        list<charging_station> free_stations <- candidates where (!each.is_full());
-        if (!empty(free_stations)) {
-            // Parmi les stations libres, retourner simplement la plus proche.
-            // La distance est le seul critère pertinent quand des places sont disponibles.
-            return free_stations with_min_of (self distance_to each.location);
-        }
-
-        // --- NIVEAU 2 : toutes les stations sont pleines — WSM ---
-        // On cherche le meilleur compromis distance / file d'attente / PRIX.
-        float ratio <- (battery_threshold > 0.0) ? (battery_level / battery_threshold) : 1.0;
-        
-        // Poids dynamiques : la composante spatio-temporelle (alpha+beta) vs la financière (gamma)
-        float gamma        <- price_sensitivity;
-        float non_fin_w    <- 1.0 - gamma;
-        float alpha_factor <- non_fin_w * min(1.0, ratio);
-        float alpha        <- alpha_factor; 
-        float beta         <- non_fin_w - alpha_factor;
-
-        float max_dist  <- max(candidates collect (self distance_to each.location));
-        float max_queue <- float(max(candidates collect length(each.queue)));
-        float max_price <- max(candidates collect each.current_price);
-        if (max_dist  <= 0.0) { max_dist  <- 1.0; }
-        if (max_queue <= 0.0) { max_queue <- 1.0; }
-        if (max_price <= 0.0) { max_price <- 1.0; }
-
-        charging_station best       <- nil;
-        float            best_score <- #infinity;
-        loop s over: candidates {
-            float nd <- (self distance_to s.location) / max_dist;
-            float nq <- float(length(s.queue)) / max_queue;
-            float np <- s.current_price / max_price;
-            float sc <- alpha * nd + beta * nq + gamma * np;
-            if (sc < best_score) { best_score <- sc; best <- s; }
-        }
-        return best;
     }
 
     // -------------------------------------------------------
@@ -934,19 +937,24 @@ species vehicle skills: [moving] {
         draw rectangle(fill_w, 4.0)
              at: {location.x - (bar_w - fill_w) / 2.0, location.y - icon_size * 0.72}
              color: rgb(br, bg, 0);
+             
+        // Valeur Numérique SoC au-dessus
+        draw string(int(battery_level)) + "%"
+             at: {location.x - icon_size * 0.3, location.y - icon_size * 1.1}
+             color: rgb(br, bg, 0) font: font("Arial", 10, #bold);
 
         // Label SoH dégradé (< 95%)
         if (battery_soh < 95.0) {
             draw "SoH:" + string(int(battery_soh)) + "%"
                  at: {location.x + icon_size * 0.55, location.y + icon_size * 0.3}
-                 color: #yellow font: font("Arial", 8, #plain);
+                 color: #yellow font: font("Arial", 6, #plain);
         }
         
         // Label Profil Hétérogène
         string lbl <- (profile="taxi") ? "TAXI" : ((profile="delivery") ? "LIVR" : "");
         if (lbl != "") {
              draw lbl at: {location.x - icon_size*0.4, location.y - icon_size*0.9}
-                  color: (profile="taxi") ? #yellow : #cyan font: font("Arial", 7, #bold);
+                  color: (profile="taxi") ? #yellow : #cyan font: font("Arial", 5, #bold);
         }
     }
 
@@ -987,10 +995,12 @@ species vehicle skills: [moving] {
         draw rectangle(fill_w, 3.0)
              at: {location.x - (bar_w - fill_w) / 2.0, location.y - 13.0}
              color: rgb(br, bg, 0);
+             
+        // Valeur Numérique SoC au-dessus
+        draw string(int(battery_level)) + "%"
+             at: {location.x - 8.0, location.y - 22.0}
+             color: rgb(br, bg, 0) font: font("Arial", 9, #bold);
     }
-
-        // Étiquette état (petit texte) pour faciliter le débogage visuel
-        // draw string(state) at: {location.x + 8, location.y} color: col font: font("Arial", 6, #plain);
 }
 
 // =============================================================
@@ -1145,8 +1155,7 @@ experiment EVSimulation type: gui {
                 }
             }
 
-            // [CORRECTION] : total_wait_time ne comptabilise que les véhicules
-            // passés par la file FIFO. Avec 15 stations × 4 places = 60 slots pour
+            
             // 50 véhicules, la file est rare. Ce graphique montre :
             //   - L'attente cumulée réelle (quand file active)
             //   - Le nb d'entrées en file (total_queue_entries)
@@ -1210,7 +1219,7 @@ experiment EVSimulation type: gui {
 //  EXPÉRIMENTATION BATCH
 //  ALGORITHME 11 : Grid Search — Exploration exhaustive
 //  Toutes les combinaisons des paramètres "among:" sont simulées
-//  3 fois chacune (seeds différents) pour la robustesse statistique.
+//  3 fois chacune (seeds différents).
 // =============================================================
 experiment BatchExploration type: batch repeat: 3 until: (cycle >= 5000) keep_seed: false {
 
