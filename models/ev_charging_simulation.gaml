@@ -39,6 +39,11 @@ global {
     int   nb_vehicles      <- 80;
     int   nb_stations      <- 5;   // 12 × 3 = 36 slots < 80 → file FIFO garantie
     int   station_capacity <- 3;
+    
+    // -------------------------------------------------------
+    // NOUVEAUX AGENTS : TECHNICIENS
+    // -------------------------------------------------------
+    int   nb_technicians   <- 3;
 
     float initial_battery_min <- 10.0;   // Véhicules en crise dès t=0
     float initial_battery_max <- 100.0;
@@ -101,8 +106,32 @@ global {
     image_file icon_station_busy <- image_file("../images/station_busy.png");
 
     // -------------------------------------------------------
-    // 10. VARIABLES GLOBALES DE MONITORING
+    // 10. VARIABLES GLOBALES DE MONITORING ET MÉTÉO
     // -------------------------------------------------------
+    // --- MÉTÉO DYNAMIQUE ---
+    float  rain_intensity <- 0.0;
+    string weather_state  <- "sunny"; // "sunny" ou "rainy"
+    int    weather_timer  <- 0;
+    int    next_weather_change <- 400; // Cycles restants avant bascule (évalué à l'init)
+
+    reflex update_weather {
+        weather_timer <- weather_timer + 1;
+        // Changer d'état 
+        if (weather_timer > next_weather_change) {
+            weather_state <- (weather_state = "sunny") ? "rainy" : "sunny";
+            weather_timer <- 0;
+            next_weather_change <- rnd(400, 600); // Prochain changement déterministe
+        }
+
+        if (weather_state = "rainy") {
+            // La pluie monte progressivement (max 1.0)
+            rain_intensity <- min(1.0, rain_intensity + 0.01);
+        } else {
+            // Le soleil revient progressivement
+            rain_intensity <- max(0.0, rain_intensity - 0.01);
+        }
+    }
+
     graph        road_network;
 
     // Points naviguables garantis = endpoints des tronçons (nœuds du graphe).
@@ -194,6 +223,11 @@ global {
         }
         write string(nb_stations) + " stations créées (sur nœuds du graphe).";
 
+        write "=== Création des techniciens ===";
+        create technician number: nb_technicians {
+            location <- one_of(navigable_locs);
+        }
+
         write "=== Création des véhicules ===";
         create vehicle number: nb_vehicles {
             // Placement sur un nœud réel du graphe = garanti navigable dès t=0
@@ -205,25 +239,28 @@ global {
             if (proba < 0.60) {
                 profile <- "taxi";
                 battery_capacity_kwh   <- 20.0;
-                energy_consumption_kwh <- 0.40;
+                base_energy_consumption_kwh <- 0.40;
                 battery_threshold      <- 15.0;
-                speed                  <- 40.0 / 3.6;
+                base_speed             <- 40.0 / 3.6;
                 price_sensitivity      <- 0.2; // Préfère le temps (+ alpha) à l'argent
             } else if (proba < 0.80) {
                 profile <- "delivery";
                 battery_capacity_kwh   <- 60.0;
-                energy_consumption_kwh <- 0.80;
+                base_energy_consumption_kwh <- 0.80;
                 battery_threshold      <- 30.0;
-                speed                  <- 30.0 / 3.6; // Plus lent
+                base_speed             <- 30.0 / 3.6; // Plus lent
                 price_sensitivity      <- 0.5; // Équilibré
             } else {
                 profile <- "personal";
                 battery_capacity_kwh   <- 35.0;
-                energy_consumption_kwh <- 0.30;
+                base_energy_consumption_kwh <- 0.30;
                 battery_threshold      <- 40.0; // Anxieux de la panne
-                speed                  <- 40.0 / 3.6;
+                base_speed             <- 40.0 / 3.6;
                 price_sensitivity      <- 0.8; // Préfère détours pour bornes moins chères
             }
+            
+            speed <- base_speed;
+            energy_consumption_kwh <- base_energy_consumption_kwh;
             
             state         <- "driving";
             initial_soh   <- rnd(85.0, 100.0);
@@ -320,13 +357,10 @@ species charging_station {
     
     // Nouveaux ajouts : Résilience et Pannes
     bool isOperational <- true;
+    bool is_getting_repaired <- false;
     
     reflex station_breakdown when: isOperational and flip(0.0005) {
         isOperational <- false;
-    }
-    
-    reflex station_repair when: (!isOperational) and flip(0.005) {
-        isOperational <- true;
     }
 
     // Mise à jour économique : le prix fluctue avec l'affluence (file d'attente incluse)
@@ -444,10 +478,19 @@ species vehicle skills: [moving] {
     // --- HÉTÉROGÉNÉITÉ & ÉCONOMIE ---
     string           profile;
     float            battery_capacity_kwh;
+    float            base_energy_consumption_kwh;
     float            energy_consumption_kwh;
     float            battery_threshold;
     float            price_sensitivity;
+    float            base_speed;
     int              parked_counter <- 0;
+    bool             is_getting_repaired <- false;
+    
+    // NOUVEAU : Adapter la vitesse et conso à la pluie
+    reflex adapt_to_weather {
+        speed <- base_speed * (1.0 - (0.4 * rain_intensity));
+        energy_consumption_kwh <- base_energy_consumption_kwh * (1.0 + (0.2 * rain_intensity));
+    }
     
     // Réservation et priorité
     float targetArrivalTime <- 0.0;
@@ -772,9 +815,18 @@ species vehicle skills: [moving] {
     // -------------------------------------------------------
     reflex do_charge when: (state = "charging") {
 
-        // Garde : incohérence d'état possible → retour à "driving"
-        if (target_station = nil) {
-            state <- "driving";
+        // Garde : incohérence d'état possible ou borne tombée en panne pendant qu'on charge
+        if (target_station = nil or !target_station.isOperational) {
+            if (target_station != nil) {
+                // Se détacher silencieusement de la station en libérant le port physique
+                ask target_station { occupied_slots <- max(0, occupied_slots - 1); }
+                if (!(target_station in blacklisted_stations)) {
+                    add target_station to: blacklisted_stations;
+                }
+            }
+            state <- "searching";
+            target_station <- nil;
+            reached_station <- false;
             return;
         }
 
@@ -818,26 +870,9 @@ species vehicle skills: [moving] {
     // -------------------------------------------------------
     // FSM — ÉTAT : broken
     //   Clignotement visuel via cycle mod.
-    //   Récupération automatique après breakdown_recovery_cycles.
-    //   Le dépannage recharge la batterie à 25% → state "searching".
+    //   Le dépannage s'effectue par l'intervention externe d'un technicien (espèce technician).
     // -------------------------------------------------------
-    reflex do_recovery when: (state = "broken") {
-        // Enregistrer le cycle de panne (une seule fois)
-        if (breakdown_cycle = 0) { breakdown_cycle <- cycle; }
 
-        // Récupération après N cycles (dépannage virtuel)
-        if (cycle - breakdown_cycle >= breakdown_recovery_cycles) {
-            battery_level        <- 25.0;
-            state                <- "searching";
-            breakdown_cycle      <- 0;
-            target_station       <- nil;
-            target_point         <- nil;
-            reached_station      <- false;
-            stuck_counter        <- 0;
-            blacklisted_stations <- [];   // Réinitialiser la liste noire après dépannage
-            total_recoveries     <- total_recoveries + 1;
-        }
-    }
 
     // -------------------------------------------------------
     // ACTION : Consommation d'énergie sur distance réelle
@@ -1004,6 +1039,88 @@ species vehicle skills: [moving] {
 }
 
 // =============================================================
+//  ESPÈCE : technician
+// =============================================================
+species technician skills: [moving] {
+    string state <- "patrolling";
+    agent target_agent <- nil;
+    int repair_timer <- 0;
+    float speed <- 50.0 / 3.6;
+
+    reflex adapt_to_weather {
+        speed <- (50.0 / 3.6) * (1.0 - (0.4 * rain_intensity));
+    }
+
+    reflex search_incident when: state = "patrolling" {
+        // Chercher une station en panne
+        charging_station broken_st <- one_of(charging_station where (!each.isOperational and !each.is_getting_repaired));
+        if (broken_st != nil) {
+            target_agent <- broken_st;
+            broken_st.is_getting_repaired <- true;
+            state <- "dispatched";
+            return;
+        }
+
+        // Chercher un véhicule en panne
+        vehicle broken_v <- one_of(vehicle where (each.state = "broken" and !each.is_getting_repaired));
+        if (broken_v != nil) {
+            target_agent <- broken_v;
+            broken_v.is_getting_repaired <- true;
+            state <- "dispatched";
+            return;
+        }
+
+        // Patrouille aléatoire
+        do goto target: one_of(navigable_locs) on: road_network speed: speed;
+    }
+
+    reflex go_to_incident when: state = "dispatched" {
+        if (target_agent = nil) { state <- "patrolling"; return; }
+        
+        do goto target: target_agent.location on: road_network speed: speed;
+        
+        if (location distance_to target_agent.location < 15.0) {
+            state <- "repairing";
+            repair_timer <- 20; // 20 cycles pour réparer (~100s)
+        }
+    }
+
+    reflex repair when: state = "repairing" {
+        repair_timer <- repair_timer - 1;
+        if (repair_timer <= 0) {
+            if (target_agent is charging_station) {
+                charging_station st <- charging_station(target_agent);
+                st.isOperational <- true;
+                st.is_getting_repaired <- false;
+            } else if (target_agent is vehicle) {
+                vehicle v <- vehicle(target_agent);
+                v.battery_level <- 25.0; // Recharge d'urgence via dépanneuse
+                v.state <- "searching";
+                v.reached_station <- false;
+                v.target_station <- nil;
+                v.target_point <- nil;
+                v.stuck_counter <- 0;
+                v.blacklisted_stations <- [];
+                v.is_getting_repaired <- false;
+                v.breakdown_cycle <- 0;
+                total_recoveries <- total_recoveries + 1;
+            }
+            target_agent <- nil;
+            state <- "patrolling";
+        }
+    }
+
+    aspect base {
+        draw triangle(15) color: #magenta border: #white;
+        if (state = "repairing") {
+            draw "FIXING" at: {location.x, location.y - 15} color: #white font: font("Arial", 8, #bold);
+        } else if (state = "dispatched") {
+            draw "SOS" at: {location.x, location.y - 15} color: #magenta font: font("Arial", 8, #bold);
+        }
+    }
+}
+
+// =============================================================
 //  EXPÉRIMENTATION GUI
 // =============================================================
 experiment EVSimulation type: gui {
@@ -1034,7 +1151,17 @@ experiment EVSimulation type: gui {
         display "Carte GIS" type: opengl background: rgb(20, 20, 30) {
             species road             aspect: base;
             species charging_station aspect: icon_aspect;
+            species technician       aspect: base;
             species vehicle          aspect: icon_aspect;
+            
+            // Météo Overlay
+            graphics "Weather" {
+                if (rain_intensity > 0.0) {
+                    draw "MÉTÉO: PLUIE (" + string(int(rain_intensity*100)) + "%)" at: {world.shape.width/2 - 200, 200} color: #cyan font: font("Arial", 20, #bold);
+                } else {
+                    draw "MÉTÉO: SOLEIL" at: {world.shape.width/2 - 200, 200} color: #yellow font: font("Arial", 20, #bold);
+                }
+            }
         }
 
         // TABLEAU DE BORD 1 — États & Flux
