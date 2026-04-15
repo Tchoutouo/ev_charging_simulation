@@ -21,6 +21,7 @@ participant "vehicle V1" as V1
 participant "vehicle V2" as V2
 participant "charging_station S" as S
 participant "road_network" as N
+participant "technician T" as T
 
 note over G : Chaque cycle, GAMA active\ntous les réflexes en parallèle
 
@@ -86,6 +87,19 @@ note over V2 : V2 est maintenant\nen recharge
 G -> V2 : [reflex do_queue, battery=0]
 V2 -> S : (V2 in queue) → remove V2 from queue
 V2 --> V2 : breakdown()\n[state="broken"]
-note over V2 : V2 quitte proprement\nla file avant mise en panne
+note over V2 : V2 quitte proprement\nla file avant panne
+
+G -> T : [reflex search_incident]
+T -> V2 : détecte V2 (target_agent = V2)
+T --> T : state = "dispatched"
+
+loop T navigue vers V2
+    G -> T : [reflex go_to_incident]
+    T -> N : do goto(V2.location)
+end
+
+T -> V2 : Répare sur place (20 cycles)
+T -> V2 : battery <- 25%\nstate <- "searching"
+note over T : T libère V2 et\nretourne patrouiller
 
 @enduml

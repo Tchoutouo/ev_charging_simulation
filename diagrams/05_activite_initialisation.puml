@@ -50,9 +50,11 @@ endwhile (Non)
 :i ← 0;
 while (i < nb_vehicles ?) is (Oui)
     :location ← any_location_in(one_of(road));
-    :battery_level ← rnd(40%, 100%);
-    :battery_soh ← rnd(85%, 100%);
-    :speed ← vehicle_speed / 3.6  [m/s];
+    :battery_level ← rnd(10%, 100%);
+    :Assigner profile (taxi/delivery/personal);
+    :Assigner is_nocturnal (proba relative);
+    :home_location ← location;
+    :Vitesse & Conso liées au profil;
     :state ← "driving";
     :stuck_counter ← 0;
     :i++;

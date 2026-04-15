@@ -1,0 +1,39 @@
+# Plan d'Amélioration : Stochastique Temporelle & Organique
+
+Ce plan propose de rendre l'horloge biologique des véhicules (réveil, trafic, retour à la maison) plus "organique" en introduisant des probabilités, évitant l'effet robotique du "Il est 19h00, 100% de la flotte se gare instantanément". 
+
+## User Review Required
+
+> [!IMPORTANT]
+> L'ajout de comportements stochastiques peut légèrement altérer les "pics" de consommation de la simulation. La charge des stations sera plus éparpillée car le comportement sera lissé dans le temps. Confirmez-vous ce comportement ?
+
+## Proposed Changes
+
+### Composant Véhicules (FSM & Logique de mobilité)
+
+L'idée est de passer de transitions *déterministes* (basées strictement sur l'heure) à des transitions *probabilistes* influencées par l'heure.
+
+#### [MODIFY] `models/ev_charging_simulation.gaml`
+- **Le Réveil (sleeping)** :
+  - **Avant** : Tous les véhicules "dormant" chez eux se réveillent simultanément à 06h00.
+  - **Après** : À partir de 06h00, chaque véhicule a une probabilité modérée (`flip(0.02)` par cycle) de démarrer sa journée. Cela crée une **vague de départs** répartie entre 6h et 9h.
+- **La Journée (driving et parked)** :
+  - Un véhicule "personal" qui se balade en journée a de fortes chances de trouver un endroit où se garer (ex: travail/courses) et d'y rester longtemps (de 100 à 400 cycles).
+  - Cela simule qu'en dehors des heures de pointe, **une grande partie de la flotte de particuliers est inactive (garée dans la rue)**.
+- **L'Heure de Pointe (rush hour 17h-19h)** :
+  - L'heure de pointe devient le moment où ceux qui étaient garés finissent leur travail. Chaque véhicule "parked" a une probabilité accrue de se réveiller pendant le rush pour rentrer chez lui (`going_home`), saturant ainsi les routes.
+- **Le Retour Nocturne (going_home)** :
+  - **Avant** : À 19h00 pétantes, la FSM basculait tout le monde vers `going_home`.
+  - **Après** : Tout au long de la soirée et de la nuit, les conducteurs se décident progressivement à rentrer ou continuent un peu de rouler au hasard. La probabilité de rentrer chez soi monte fortement la nuit (`flip(0.02)`).
+
+## Open Questions
+
+- Les taxis doivent-ils aussi arrêter leur service la nuit ou préférez-vous que seuls les "particuliers" dorment chez eux ? (Le plan actuel laisse les taxis et les livreurs rouler librement sur le réseau 24h/24h pour capter les recharges de nuit).
+
+## Verification Plan
+
+### Manual Verification
+- Lancer la simulation et accélérer la vitesse du temps avec le paramètre GUI (Vitesse horloge).
+- Observer qu'à la tombée de la nuit, les icônes de "Maison bleue" n'apparaissent pas toutes en un seul cycle (comme un flash), mais progressivement sous la forme de départs individuels.
+- Observer le matin (à la disparation du `NightMask`), tous les véhicules ne démarrent pas en un seul bloc, mais quittent leur domicile petit à petit.
+- Consulter le "Distribution des états" dans le tableau de bord pour valider qu'un pourcentage de la flotte est en "🚗 Roulant" même en pleine nuit.

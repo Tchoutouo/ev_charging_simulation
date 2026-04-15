@@ -20,6 +20,7 @@ actor "Environnement\nGAMA" as ENV
 participant "vehicle V1\n(FSM)" as V
 participant "charging_station S1\n(FIFO)" as S
 participant "road_network\n(Graphe)" as G
+participant "technician T1\n(Dépannage)" as T
 
 == Phase 1 : Déplacement normal (state = driving) ==
 
@@ -89,18 +90,27 @@ V --> V : target_station ← nil\nreached_station ← false\nstate ← "driving"
 
 note over V : Cycle complet terminé\nV1 reprend la route avec batterie rechargée
 
-== Phase 5 : Récupération de panne ==
+== Phase 5 : Récupération de panne (Technicien) ==
 
-note over V : Si battery = 0 : breakdown()
+note over V : Si battery = 0 : breakdown()\nV1 passe en state = "broken"
 
-ENV -> V : do_recovery() reflex [state=broken]
-V -> V   : blink_visible = (cycle mod 10 < 5)\n[Effet clignotant]
+ENV -> T : search_incident() reflex
+T -> T : target_agent ← V1\nstate ← "dispatched"
 
-loop Pendant breakdown_recovery_cycles (100 cycles)
-    ENV -> V : do_recovery()
-    V -> V   : Attente dépannage
+loop Navigation Technicien
+    ENV -> T : go_to_incident() reflex
+    T -> G : do goto(V1.location)
+    G --> T : position mise à jour
 end
 
-V --> V : battery ← 25.0\nstuck_counter ← 0\nstate ← "searching"
+T -> T : state ← "repairing" (20 cycles)
+
+loop Pendant réparation
+    ENV -> T : repair() reflex
+    T -> T : timer--
+end
+
+T -> V : battery ← 25.0\nstate ← "searching"
+T -> T : target_agent ← nil\nstate ← "patrolling"
 
 @enduml

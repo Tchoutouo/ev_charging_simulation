@@ -12,10 +12,10 @@ skinparam NoteBackgroundColor #2E2E4E
 skinparam NoteBorderColor #5555AA
 skinparam NoteFontColor #CCCCFF
 
-title Diagramme d'Activités — Comportement d'un Véhicule (1 cycle GAMA)
+title Diagramme d'Activités — Comportement d'un Véhicule (1 cycle)
 
 start
-note right : **1 cycle = 30 secondes simulées**
+note right : cycle évalué avec **adapt_to_environment()**
 
 ' ===== DISPATCH FSM =====
 if (state == ?) then
@@ -28,6 +28,8 @@ if (state == ?) then
     split again
         -[#00AACC]-> "charging";
     split again
+        -[#95A5A6]-> "parked/\ngoing_home/\nsleeping";
+    split again
         -[#FF4444]-> "broken";
     end split
 endif
@@ -35,28 +37,29 @@ endif
 ' ===== DRIVING =====
 if (state = "driving") then (Oui)
     if (battery ≤ 0 ?) then (Oui)
-        :breakdown()\n[broken++, cleanup];
+        :breakdown();
         stop
     endif
-    if (battery < threshold ?) then (Oui)
+    
+    if (proba aller dormir / proba se garer ?) then (Oui)
+        :state ← "going_home" / "parked";
+        stop
+    endif
+
+    if (battery < threshold ou trajet instable ?) then (Oui)
         :state ← "searching"\ntarget_point ← nil;
         stop
     endif
+    
     if (target_point = nil ?) then (Oui)
-        :target_point ← random road point\nstuck_counter ← 0;
+        :target_point ← random road point;
     endif
-    :prev_loc ← location\ndo goto(target_point, road_network)\n**[Dijkstra]**;
-    :dist_moved ← dist(location, prev_loc)\nconsume_energy_for(dist_moved)\n**[kWh/km model] + SoH update**;
-    if (dist_moved < 1m AND dist_to_target > threshold) then (Bloqué)
-        :stuck_counter++;
-        if (stuck_counter ≥ max_stuck_cycles) then (Oui)
-            :target_point ← nil\nstuck_counter ← 0;
-        endif
-    else (Normal)
-        :stuck_counter ← 0;
-        if (dist_to_target < arrival_threshold) then (Arrivé)
-            :target_point ← nil;
-        endif
+    
+    :do goto(target_point) **[Dijkstra]**;
+    :consume_energy_for();
+    
+    if (Stuck block > limites) then (Oui)
+        :nouveau target_point;
     endif
     stop
 endif
@@ -68,35 +71,20 @@ if (state = "searching") then (Oui)
         stop
     endif
     :best ← select_best_station()\n**[WSM : α·dist + β·queue]**;
-    if (best = nil ?) then (Oui)
-        :Déplacement aléatoire\ndétection de blocage (stuck);
-        stop
+    if (best != nil ?) then (Oui)
+        :target_station ← best\nstate ← "queuing";
     endif
-    :target_station ← best\nreached_station ← false\nstuck_counter ← 0\nstate ← "queuing";
     stop
 endif
 
 ' ===== QUEUING =====
 if (state = "queuing") then (Oui)
-    if (battery ≤ 0 ?) then (Oui)
-        :Quitter la file\nbreakdown();
-        stop
-    endif
-    if (target_station = nil ?) then (Oui)
-        :state ← "searching";
-        stop
-    endif
-    if (!reached_station AND dist > threshold) then (En route)
-        :do goto(station.location, road_network)\n**[Dijkstra]**\nconsume_energy_for()\nstuck detection;
+    if (dist à station > threshold) then (En route)
+        :do goto(station.location)\nconsume_energy_for();
         stop
     else (Arrivé)
-        :reached_station ← true\nstuck_counter ← 0;
-        if (self in queue ?) then (Oui)
-            :Attendre (FIFO actif);
-            stop
-        endif
         if (station.is_full() ?) then (Oui)
-            :add_to_queue(self)\n**[FIFO]**\nwaiting_time_start ← cycle;
+            :add_to_queue(self)\nAttente **[FIFO]**;
         else (Non)
             :occupied_slots++\nstate ← "charging";
         endif
@@ -106,33 +94,24 @@ endif
 
 ' ===== CHARGING =====
 if (state = "charging") then (Oui)
-    if (target_station = nil ?) then (Oui)
-        :state ← "driving" [guard];
-        stop
-    endif
-    if (battery < 80%) then (Phase CC)
-        :P = charging_power_kw\n(pleine puissance);
-    else (Phase CV)
-        :soc_factor = 1 - (soc-80)/20 × 0.9\nP = charging_power_kw × max(0.1, soc_factor)\n**[CC-CV Li-ion]**;
-    endif
-    :energy = P × (step/3600)\nbattery += energy/capacité × 100;
+    :Courbe de charge CC/CV\nbattery += energy_gained;
     if (battery ≥ SoH × 95%) then (Rechargé)
-        :release_vehicle(self) → station\n[start_charging() pour FIFO\ntarget_station ← nil\nstate ← "driving"];
+        :release_vehicle()\nstate ← "driving";
     endif
     stop
 endif
 
 ' ===== BROKEN =====
 if (state = "broken") then (Oui)
-    if (breakdown_cycle = 0) then
-        :breakdown_cycle ← cycle;
-    endif
-    note right : Clignotement visuel :\n(cycle mod 10) < 5
-    if (cycle - breakdown_cycle ≥ N) then (Récupéré)
-        :battery ← 25%\nstuck_counter ← 0\ntotal_recoveries++\nstate ← "searching";
-    else (Attente)
-        :Continuer à attendre;
-    endif
+    :Attendre l'arrivée du\nTechnicien (is_getting_repaired);
+    note right : Le technicien gère le\nretour à l'état searching
+    stop
+endif
+
+' ===== PARKED / GOING_HOME / SLEEPING =====
+if (state = "parked / going_home / sleeping") then (Oui)
+    :Gestion probabiliste du réveil;
+    :Déplacement vers home_location (si going_home);
     stop
 endif
 

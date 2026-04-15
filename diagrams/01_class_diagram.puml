@@ -20,8 +20,14 @@ class GlobalEnvironment <<global>> {
     ' -- Données GIS --
     + roads_file : file
     + road_network : graph
-    ' -- Temps --
-    + step : float = 30.0 s/cycle
+    ' -- Temps & Météo --
+    + step : float = 5.0 s/cycle
+    + time_multiplier : float = 60.0
+    + current_time_hours : float
+    + is_rush_hour : bool
+    + is_night : bool
+    + rain_intensity : float
+    + weather_state : string
     ' -- Paramètres simulation --
     + nb_vehicles : int = 50
     + nb_stations : int = 15
@@ -66,11 +72,16 @@ class charging_station <<species>> {
     + occupied_slots : int = 0
     + queue : list<vehicle> = []
     + nb_served : int = 0
+    + current_price : float
+    + isOperational : bool
+    + is_getting_repaired : bool
     --
     ' -- Actions FIFO --
     + add_to_queue(v : vehicle) : void
     + start_charging() : void
     + release_vehicle(v : vehicle) : void
+    + get_shared_power_kw() : float
+    + update_economics() : reflex
     ' -- Fonctions --
     + is_full() : bool
     + occupancy_rate() : float
@@ -91,6 +102,14 @@ class vehicle <<species>> {
     + distance_traveled : float
     + total_km : float
     + waiting_time_start : int
+    ' -- Hétérogénéité & Personnalité --
+    + profile : string
+    + base_speed : float
+    + battery_capacity_kwh : float
+    + battery_threshold : float
+    + is_nocturnal : bool
+    + home_location : point
+    + is_getting_repaired : bool
     ' -- Contrôleurs internes --
     + reached_station : bool = false
     + stuck_counter : int = 0
@@ -98,10 +117,13 @@ class vehicle <<species>> {
     --
     ' -- Réflexes FSM --
     + do_drive() : reflex [state="driving"]
+    + do_parked() : reflex [state="parked"]
     + do_search() : reflex [state="searching"]
     + do_queue() : reflex [state="queuing"]
     + do_charge() : reflex [state="charging"]
-    + do_recovery() : reflex [state="broken"]
+    + do_go_home() : reflex [state="going_home"]
+    + do_sleep() : reflex [state="sleeping"]
+    + adapt_to_environment() : reflex
     ' -- Actions utilitaires --
     + consume_energy_for(dist_m : float) : void
     + update_soh() : void
@@ -112,15 +134,28 @@ class vehicle <<species>> {
     + base() : aspect
 }
 
+' ===================== TECHNICIAN =====================
+class technician <<species>> {
+    + state : string
+    + target_agent : agent
+    + repair_timer : int
+    + search_incident() : reflex
+    + go_to_incident() : reflex
+    + repair() : reflex
+}
+
 ' ===================== RELATIONS =====================
 
 GlobalEnvironment "1" o-- "N" road : crée >
-GlobalEnvironment "1" o-- "15" charging_station : crée >
-GlobalEnvironment "1" o-- "50" vehicle : crée >
+GlobalEnvironment "1" o-- "nb_stations" charging_station : crée >
+GlobalEnvironment "1" o-- "nb_vehicles" vehicle : crée >
+GlobalEnvironment "1" o-- "nb_technicians" technician : crée >
 GlobalEnvironment "1" -- "1" road_network : construit graphe >
 
 vehicle "0..*" --> "0..1" charging_station : target_station >
 charging_station "1" o-- "0..*" vehicle : queue <
+technician "0..*" --> "0..1" vehicle : target_agent (répare)
+technician "0..*" --> "0..1" charging_station : target_agent (répare)
 
 note right of vehicle
   <b>Skill</b> : moving (GAMA)

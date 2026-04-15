@@ -106,8 +106,14 @@ global {
     image_file icon_station_busy <- image_file("../images/station_busy.png");
 
     // -------------------------------------------------------
-    // 10. VARIABLES GLOBALES DE MONITORING ET MÉTÉO
+    // 10. VARIABLES GLOBALES DE MONITORING ET TEMPS
     // -------------------------------------------------------
+    // --- TEMPS DYNAMIQUE ---
+    float  time_multiplier    <- 60.0; // 1 cycle simule X cycles pour l'horloge (accélération visuelle)
+    float  current_time_hours update: (8.0 + (cycle * step * time_multiplier / 3600.0)) mod 24.0;
+    bool   is_rush_hour       update: current_time_hours >= 17.0 and current_time_hours < 19.0;
+    bool   is_night           update: current_time_hours >= 19.0 or current_time_hours < 6.0;
+
     // --- MÉTÉO DYNAMIQUE ---
     float  rain_intensity <- 0.0;
     string weather_state  <- "sunny"; // "sunny" ou "rainy"
@@ -243,6 +249,7 @@ global {
                 battery_threshold      <- 15.0;
                 base_speed             <- 40.0 / 3.6;
                 price_sensitivity      <- 0.2; // Préfère le temps (+ alpha) à l'argent
+                is_nocturnal           <- flip(0.40); // 40% des taxis travaillent de nuit
             } else if (proba < 0.80) {
                 profile <- "delivery";
                 battery_capacity_kwh   <- 60.0;
@@ -250,6 +257,7 @@ global {
                 battery_threshold      <- 30.0;
                 base_speed             <- 30.0 / 3.6; // Plus lent
                 price_sensitivity      <- 0.5; // Équilibré
+                is_nocturnal           <- flip(0.20); // 20% des livreurs la nuit
             } else {
                 profile <- "personal";
                 battery_capacity_kwh   <- 35.0;
@@ -257,10 +265,13 @@ global {
                 battery_threshold      <- 40.0; // Anxieux de la panne
                 base_speed             <- 40.0 / 3.6;
                 price_sensitivity      <- 0.8; // Préfère détours pour bornes moins chères
+                is_nocturnal           <- flip(0.05); // 5% des particuliers (ex: urgences, gardes)
             }
             
             speed <- base_speed;
             energy_consumption_kwh <- base_energy_consumption_kwh;
+            
+            home_location <- location;
             
             state         <- "driving";
             initial_soh   <- rnd(85.0, 100.0);
@@ -485,11 +496,23 @@ species vehicle skills: [moving] {
     float            base_speed;
     int              parked_counter <- 0;
     bool             is_getting_repaired <- false;
+    point            home_location <- nil;
+    bool             is_nocturnal <- false;
     
-    // NOUVEAU : Adapter la vitesse et conso à la pluie
-    reflex adapt_to_weather {
-        speed <- base_speed * (1.0 - (0.4 * rain_intensity));
-        energy_consumption_kwh <- base_energy_consumption_kwh * (1.0 + (0.2 * rain_intensity));
+    // NOUVEAU : Adapter la vitesse et conso à l'environnement (Météo + Heures de pointe)
+    reflex adapt_to_environment {
+        float env_speed_factor <- 1.0 - (0.4 * rain_intensity);
+        float env_conso_factor <- 1.0 + (0.2 * rain_intensity);
+
+        if (is_rush_hour) {
+            env_speed_factor <- env_speed_factor * 0.3; // Ralentissement majeur dans les bouchons
+            if (profile = "taxi") {
+                env_conso_factor <- env_conso_factor * 1.5; // Vidage de batterie (Clim/Chauffage et arrêts)
+            }
+        }
+
+        speed <- base_speed * env_speed_factor;
+        energy_consumption_kwh <- base_energy_consumption_kwh * env_conso_factor;
     }
     
     // Réservation et priorité
@@ -535,6 +558,26 @@ species vehicle skills: [moving] {
     reflex do_drive when: (state = "driving") {
         if (battery_level <= 0.0) { do breakdown; return; }
 
+        bool wants_to_go_home <- false;
+        
+        // Logique "organique" de retour au domicile au lieu d'une décision unanime à 19h00
+        if (is_night and !is_nocturnal) {
+            wants_to_go_home <- flip(0.02); // Les travailleurs de jour rentrent dormir la nuit
+        } else if (!is_night and is_nocturnal) {
+            // Les travailleurs de nuit rentrent progressivement se coucher en journée (pas immédiatement à 6h)
+            if (current_time_hours > 6.0 and current_time_hours < 16.0) {
+                wants_to_go_home <- flip(0.01); 
+            }
+        } else if (is_rush_hour and profile = "personal") {
+            wants_to_go_home <- flip(0.005); // Fin du travail pendulaire (se prépare au retour)
+        }
+
+        if (wants_to_go_home) {
+            state <- "going_home";
+            target_point <- nil;
+            return;
+        }
+
         // NOUVEAU: Anticipation = seuil critique OU batterie insuffisante pour faire le trajet + marge station
         bool need_charge <- false;
         if (battery_level < battery_threshold) {
@@ -558,13 +601,16 @@ species vehicle skills: [moving] {
         }
 
         // --- HÉTÉROGÉNÉITÉ : Transition vers l'état 'parked' ---
-        if (state = "driving" and profile = "personal" and target_point = nil and flip(0.005)) {
+        if (state = "driving" and profile = "personal" and target_point = nil) {
             // Un particulier qui se balade sans but précis a une probabilité
-            // de trouver sa destination et de stationner (ex: 5 à 15 minutes simulées).
-            state          <- "parked";
-            target_point   <- nil;
-            parked_counter <- rnd(50, 150); 
-            return;
+            // de trouver sa destination et de stationner. Stationne moins en rush hour.
+            float proba_park <- (is_rush_hour) ? 0.001 : 0.01;
+            if (flip(proba_park)) {
+                state          <- "parked";
+                target_point   <- nil;
+                parked_counter <- rnd(100, 400); // Garé pour une durée réaliste (travail/rdv)
+                return;
+            }
         }
 
         // Cible aléatoire sur un nœud réel du graphe (jamais un segment isolé)
@@ -607,6 +653,18 @@ species vehicle skills: [moving] {
     // FSM — ÉTAT : parked (Exclusif aux particuliers)
     // -------------------------------------------------------
     reflex do_parked when: (state = "parked") {
+        bool wants_to_go_home <- false;
+        if (is_night and !is_nocturnal) {
+            wants_to_go_home <- flip(0.05); // Accélération du départ du travail si la nuit est tombée
+        } else if (is_rush_hour) {
+            wants_to_go_home <- flip(0.015); // Ceux garés finissent leur travail et reprennent la route aux heures de pointes
+        }
+        
+        if (wants_to_go_home) {
+            state <- "going_home";
+            target_point <- nil;
+            return;
+        }
         parked_counter <- parked_counter - 1;
         
         // S'il est garé mais s'aperçoit que sa batterie est critique, il sort pour charger
@@ -873,6 +931,47 @@ species vehicle skills: [moving] {
     //   Le dépannage s'effectue par l'intervention externe d'un technicien (espèce technician).
     // -------------------------------------------------------
 
+    // -------------------------------------------------------
+    // FSM — ÉTAT : going_home & sleeping (Cycle Nuit)
+    // -------------------------------------------------------
+    reflex do_go_home when: (state = "going_home") {
+        if (battery_level <= 0.0) { do breakdown; return; }
+        
+        if (battery_level < battery_threshold) {
+             state <- "searching";
+             target_point <- nil;
+             target_station <- nil;
+             reached_station <- false;
+             return;
+        }
+
+        if (home_location = nil) { home_location <- one_of(navigable_locs); }
+        
+        point prev_loc  <- location;
+        do goto target: home_location on: road_network speed: speed;
+        float dist_moved <- location distance_to prev_loc;
+        do consume_energy_for(dist_moved);
+
+        if (location distance_to home_location < arrival_threshold) {
+             state <- "sleeping";
+        }
+    }
+
+    reflex do_sleep when: (state = "sleeping") {
+        bool wake_up <- false;
+        
+        if (!is_night and !is_nocturnal) {
+            wake_up <- flip(0.02); // Réveil organique et progressif le matin
+        } else if (is_night and is_nocturnal) {
+            wake_up <- flip(0.05); // Prise de poste en soirée pour les noctambules
+        }
+
+        if (wake_up) {
+             state <- "driving";
+             target_point <- nil;
+        }
+    }
+
 
     // -------------------------------------------------------
     // ACTION : Consommation d'énergie sur distance réelle
@@ -951,7 +1050,7 @@ species vehicle skills: [moving] {
         bool  blink_show <- (state != "broken") or ((cycle mod 8) < 4);
 
         image_file cur_img <- nil;
-        if      (state = "driving")   { cur_img <- icon_car_blue; }
+        if      (state = "driving" or state = "going_home" or state = "sleeping") { cur_img <- icon_car_blue; }
         else if (state = "searching") { cur_img <- icon_car_orange; }
         else if (state = "queuing")   { cur_img <- icon_car_orange; }
         else if (state = "charging")  { cur_img <- icon_car_green; }
@@ -1007,7 +1106,8 @@ species vehicle skills: [moving] {
         rgb  col;
         int  al <- 255;
 
-        if      (state = "driving")   { col <- rgb(30,  144, 255); }  // bleu
+        if      (state = "driving" or state = "going_home") { col <- rgb(30,  144, 255); }  // bleu
+        else if (state = "sleeping")  { col <- rgb(100, 100, 150); }  // gris-bleu clair
         else if (state = "searching") { col <- rgb(255, 165,   0); }  // orange
         else if (state = "queuing")   { col <- rgb(255,  80,   0); }  // orange vif
         else if (state = "charging")  { col <- rgb( 50, 220,  50); }  // vert
@@ -1129,6 +1229,7 @@ experiment EVSimulation type: gui {
     parameter "Nb stations"                var: nb_stations              min: 1      max: 100    category: "Simulation";
     parameter "Capacité station"           var: station_capacity         min: 1      max: 20     category: "Simulation";
     parameter "Pas de temps (s/cycle)"     var: step                     min: 5.0    max: 120.0  category: "Simulation";
+    parameter "Vitesse horloge (x)"        var: time_multiplier          min: 1.0    max: 200.0  category: "Simulation";
     parameter "Seuil arrivée station (m)"  var: arrival_threshold        min: 20.0   max: 500.0  category: "Simulation";
     parameter "Cycles max sans mouvement"  var: max_stuck_cycles         min: 1      max: 20     category: "Simulation";
 
@@ -1155,11 +1256,23 @@ experiment EVSimulation type: gui {
             species vehicle          aspect: icon_aspect;
             
             // Météo Overlay
-            graphics "Weather" {
+            graphics "Environment" {
                 if (rain_intensity > 0.0) {
                     draw "MÉTÉO: PLUIE (" + string(int(rain_intensity*100)) + "%)" at: {world.shape.width/2 - 200, 200} color: #cyan font: font("Arial", 20, #bold);
                 } else {
                     draw "MÉTÉO: SOLEIL" at: {world.shape.width/2 - 200, 200} color: #yellow font: font("Arial", 20, #bold);
+                }
+                
+                if (is_rush_hour) {
+                    draw "⚠️ HEURE DE POINTE (Trafic ralenti)" at: {world.shape.width/2 - 240, 250} color: #orange font: font("Arial", 20, #bold);
+                }
+            }
+
+            // Voile de Nuit (Dessiné en dernier pour recouvrir)
+            graphics "NightMask" {
+                if (is_night) {
+                    draw world.shape color: rgb(0, 0, 15, 140);
+                    draw "🌙 NUIT" at: {world.shape.width/2 - 80, 150} color: #white font: font("Arial", 20, #bold);
                 }
             }
         }
@@ -1169,6 +1282,8 @@ experiment EVSimulation type: gui {
 
             chart "Distribution des états (véhicules)" type: pie background: #white {
                 data "🚗 Roulant"   value: vehicle count (each.state = "driving")   color: #dodgerblue;
+                data "🏠 Domicile"  value: vehicle count (each.state = "going_home") color: #blue;
+                data "💤 Nuit"      value: vehicle count (each.state = "sleeping")  color: #gray;
                 data "🔍 Recherche" value: vehicle count (each.state = "searching") color: #orange;
                 data "⏳ En file"   value: vehicle count (each.state = "queuing")   color: #darkorange;
                 data "⚡ En charge" value: vehicle count (each.state = "charging")  color: #limegreen;
@@ -1299,6 +1414,7 @@ experiment EVSimulation type: gui {
         // [Simulation]
         // -------------------------------------------------------
         monitor "── SIMULATION ──"          value: "Cycle " + cycle;
+        monitor "Heure"                     value: ((current_time_hours < 10) ? "0" : "") + string(int(current_time_hours)) + ":" + (((current_time_hours * 60) mod 60 < 10) ? "0" : "") + string(int((current_time_hours * 60) mod 60));
         monitor "Cycle courant"             value: cycle;
         monitor "Temps simulé (min)"        value: with_precision(cycle * step / 60.0, 1);
         monitor "Pas de temps (s)"          value: step;
@@ -1306,6 +1422,8 @@ experiment EVSimulation type: gui {
         // [États flotte]
         monitor "── FLOTTE ──"             value: nb_vehicles;
         monitor "🚗 Roulant"               value: vehicle count (each.state = "driving");
+        monitor "🏠 Retour Domicile"       value: vehicle count (each.state = "going_home");
+        monitor "💤 Garé (Nuit)"           value: vehicle count (each.state = "sleeping");
         monitor "🔍 Recherche"             value: vehicle count (each.state = "searching");
         monitor "⏳ En file"               value: vehicle count (each.state = "queuing");
         monitor "⚡ En charge"             value: vehicle count (each.state = "charging");

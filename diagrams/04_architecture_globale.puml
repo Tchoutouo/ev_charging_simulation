@@ -26,7 +26,7 @@ package "Données d'entrée (GIS)" as INPUT #1A2A1A {
 ' ===================== COUCHE ENVIRONNEMENT =====================
 package "Couche Environnement — global{}" as ENV #1A1A3A {
     component "Graphe routier\n(as_edge_graph)" as GRAPH
-    component "Paramètres globaux\n(step, thresholds, etc.)" as PARAMS
+    component "Météo & Horloge\n(24h Cycle, Rush, Pluie)" as WEATHER
     component "Monitoring\n(breakdowns, charges, km)" as MONITOR
     component "Algorithme grille\n(placement stations)" as GRID
 }
@@ -42,8 +42,12 @@ package "Couche Agents (Espèces GAMA)" as AGENTS #2A1A3A {
         component "charging_station\nFIFO Queue\nCC-CV" as STATION_AGENT
     }
 
+    package "technician (Maintenance)" as TECH_PKG #252535 {
+        component "Technician\n(Patrouille & Dépannage)" as TECH_AGENT
+    }
+
     package "vehicle (skill: moving)" as VEHICLE_PKG #252535 {
-        component "FSM\n(driving/searching\nqueuing/charging/broken)" as FSM
+        component "FSM Organique\n(driving, charging, parked,\nsleeping, broken...)" as FSM
         component "Routage Dijkstra\n(do goto)" as ROUTER
         component "WSM Station\nSelector" as WSM
         component "Énergie kWh/km\n& SoH Dégradation" as ENERGY
@@ -65,9 +69,9 @@ SHP    --> GRAPH   : chargement shapefile
 DBF    --> GRAPH
 PRJ    --> GRAPH
 GRID   --> STATION_AGENT : placement optimal
-PARAMS --> FSM
-PARAMS --> ENERGY
-PARAMS --> STATION_AGENT
+WEATHER --> FSM
+WEATHER --> ENERGY
+WEATHER --> STATION_AGENT
 
 GRAPH  --> ROUTER : road_network partagé
 ROUTER --> FSM    : do goto()
@@ -77,6 +81,9 @@ FSM    --> WSM     : select_best_station()
 FSM    --> STUCK   : stuck_counter
 WSM    --> STATION_AGENT : query (dist, queue)
 STATION_AGENT --> FSM  : start_charging() / release_vehicle()
+
+TECH_AGENT --> FSM : repair()
+TECH_AGENT --> STATION_AGENT : repair()
 
 FSM    --> MONITOR : total_breakdowns++\ntotal_charges++
 ENERGY --> MONITOR : total_distance_km++

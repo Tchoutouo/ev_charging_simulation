@@ -12,7 +12,7 @@ skinparam NoteBackgroundColor #2E2E4E
 skinparam NoteBorderColor #5555AA
 skinparam NoteFontColor #CCCCFF
 
-title Algorithme de Sélection de Station\nWeighted Sum Method (WSM) + Adaptation Dynamique α/β
+title Algorithme de Sélection de Station\nWeighted Sum Method (WSM) + Adaptation Dynamique α/β/γ
 
 |**Véhicule V**|
 start
@@ -27,23 +27,26 @@ endif
 ' --- Algorithme 4 : Adaptation dynamique ---
 :ratio ← battery_level / battery_threshold;
 note right
-  **Algorithme 4 — Ratio dynamique**
+  **Algorithme 4 — Ratio dynamique & Hétérogénéité**
   Si batterie → 0 : ratio → 0
-  → α diminue → β augmente
-  → Priorité à la file courte
-  Si batterie > seuil : ratio ≥ 1
-  → α = alpha_base (0.7)
-  → Priorité à la distance
+  → α diminue → urgence, on veut le plus proche
+  Si batterie OK : ratio ≥ 1
+  → α = alpha_base
+  Ensuite, β (File d'attente) et γ (Prix) sont 
+  répartis selon la **price_sensitivity** du profil.
 end note
-:α ← alpha_base × min(1.0, ratio)\nβ ← 1.0 - α;
+:α ← alpha_base × min(1.0, ratio)\nγ ← (1.0 - α) × price_sensitivity\nβ ← (1.0 - α) - γ;
 
 ' --- Normalisation ---
-:max_dist ← max(distances vers toutes les stations)\nmax_queue ← max(tailles des files);
+:max_dist ← max(distances vers toutes les stations)\nmax_queue ← max(tailles des files)\nmax_price ← max(prix des stations);
 if (max_dist ≤ 0 ?) then (Oui)
     :max_dist ← 1.0;
 endif
 if (max_queue ≤ 0 ?) then (Oui)
     :max_queue ← 1;
+endif
+if (max_price ≤ 0 ?) then (Oui)
+    :max_price ← 1.0;
 endif
 
 ' --- Boucle WSM ---
@@ -54,12 +57,14 @@ endif
 repeat
     :nd ← dist(V, s) / max_dist\n[Distance normalisée ∈ [0,1]];
     :nq ← |queue(s)| / max_queue\n[File normalisée ∈ [0,1]];
-    :score ← **α × nd + β × nq**;
+    :np ← s.current_price / max_price\n[Prix normalisé ∈ [0,1]];
+    :score ← **α × nd + β × nq + γ × np**;
     note right
       **WSM — Critères :**
       nd → proximité géographique
       nq → disponibilité (file courte)
-      Pondération adaptative selon urgence
+      np → coût économique de la charge
+      Pondération adaptative + Profil (price_sensitivity)
     end note
     if (s.is_full() AND |queue| > capacity) then (Oui)
         :score ← score + 0.5\n[Pénalité saturation];

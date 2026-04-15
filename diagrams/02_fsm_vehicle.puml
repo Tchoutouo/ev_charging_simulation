@@ -14,71 +14,84 @@ skinparam NoteFontColor #CCCCFF
 
 title Diagramme d'États-Transitions (FSM) — Espèce vehicle
 
-[*] --> driving : <<init>>\nbattery = rnd(40%, 100%)
+[*] --> driving : <<init>>\nbattery = rnd(10%, 100%)
 
-' ===== ÉTAT : driving =====
+' ===== ÉTATS PRINCIPAUX =====
 state "🚗 driving" as driving #2A4A2A {
-    driving : Déplacement aléatoire\nsur le réseau routier\nAlgorithme : Dijkstra (do goto)
+    driving : Déplacement sur le réseau\nAlgorithme : Dijkstra\nRisque de parking en journée
 }
 
-' ===== ÉTAT : searching =====
 state "🔍 searching" as searching #4A3A1A {
-    searching : Sélection de la meilleure\nstation de recharge\nAlgorithme : WSM pondéré (α/β)
+    searching : Sélection de la meilleure station\nAlgorithme : WSM pondéré (α/β/γ)
 }
 
-' ===== ÉTAT : queuing =====
 state "⏳ queuing" as queuing #3A2A4A {
-    queuing : Navigation vers la station\npuis attente en file FIFO\nAlgorithme : Dijkstra + FIFO
+    queuing : Navigation vers station\n+ Attente en file FIFO
 }
 
-' ===== ÉTAT : charging =====
 state "⚡ charging" as charging #1A3A3A {
-    charging : Recharge à la borne\nAlgorithme : Courbe CC-CV\n(Constant Current / Constant Voltage)
+    charging : Recharge (Courbes CC-CV)
 }
 
-' ===== ÉTAT : broken =====
 state "💥 broken" as broken #4A1A1A {
-    broken : Véhicule en panne\nClignotement visuel\nAttente dépannage (N cycles)
+    broken : Clignotement visuel\nAttente intervention Technicien
+}
+
+' ===== NOUVEAUX ÉTATS (Cycle 24h & Profils) =====
+state "🅿️ parked" as parked #2C3E50 {
+    parked : À l'arrêt (Travail, Courses)\n(Uniquement pour profil 'personal')
+}
+
+state "🏠 going_home" as going_home #34495E {
+    going_home : Retour au domicile\nDéclenché le soir ou fins de shift
+}
+
+state "💤 sleeping" as sleeping #1A252F {
+    sleeping : Garé à la maison\nRéveil stochastique le matin
 }
 
 ' ===== TRANSITIONS =====
-driving    --> searching  : battery < battery_threshold (25%)
+driving    --> searching  : battery < seuil ou anticipation
 driving    --> broken     : battery = 0
+driving    --> parked     : proba aléatoire (en journée)
+driving    --> going_home : proba (Nuit/Fin de shift)
+
+parked     --> driving    : timeout expire
+parked     --> searching  : battery critique
+parked     --> going_home : proba (Heure de Pointe / Nuit)
+
+going_home --> sleeping   : home_location atteint
+going_home --> searching  : battery critique avant d'arriver
+
+sleeping   --> driving    : proba (au réveil / début de shift)
+
 searching  --> queuing    : station trouvée (WSM)
 searching  --> broken     : battery = 0
-queuing    --> charging   : arrivé à station\n& place disponible (FIFO)
+queuing    --> charging   : place disponible (FIFO)
 queuing    --> broken     : battery = 0 en route
-charging   --> driving    : battery ≥ SoH × 95%\n[release_vehicle()]
-broken     --> searching  : après N cycles\n[dépannage: battery=25%]
-driving    --> driving    : target_point atteint\n→ nouvelle destination
+charging   --> driving    : battery ≥ SoH × 95%
+broken     --> searching  : réparation par Technicien
 
-' ===== NOTES =====
-note right of driving
-  <b>Stuck detection :</b>
-  Si dist_moved < 1m
-  pendant max_stuck_cycles = 3
-  → Nouvelle cible aléatoire
+driving    --> driving    : target_point atteint → target=nil
+
+' ===== NOTES COMPLÉMENTAIRES =====
+note left of going_home
+  <b>Transition stochastique</b>
+  Les véhicules (selon profil is_nocturnal) 
+  décident de rentrer progressivement.
+  Pas de hard-limit (pas tous à 19h).
 end note
 
-note right of queuing
-  <b>Arrived condition :</b>
-  dist_to_station < arrival_threshold
-  (100 m par défaut)
-  <i>+ flag reached_station</i>
+note right of charging
+  <b>CC-CV & Smart Grid</b>
+  Puissance partagée à la station.
+  Dégradation batterie : SoH
 end note
 
-note left of charging
-  <b>Phase CC</b> (0→80%) : 22 kW
-  <b>Phase CV</b> (80→100%) :
-  puissance × (1 - (soc-80)/20 × 0.9)
-  Dégradation SoH : -0.5%/1000km
-end note
-
-note left of broken
-  <b>breakdown_recovery_cycles</b>
-  = 100 cycles (~50 min sim.)
-  Recharge urgence → 25%
-  puis retour à "searching"
+note right of broken
+  <b>Dépannage par Techniciens</b>
+  (Nécessite patrouille et 100 cycles 
+  de temps de réparation in situ)
 end note
 
 @enduml
